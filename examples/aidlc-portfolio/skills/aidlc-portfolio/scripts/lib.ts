@@ -1,5 +1,5 @@
 import Ajv2020, { type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   access,
   mkdir,
@@ -878,13 +878,40 @@ export async function answerQuestionPacket(
   mode: QuestionAnswerMode,
   approvalId: string,
 ): Promise<{ path: string; status: "active"; answeredBy: string }> {
-  assertId(id, "question packet id");
   assertId(approvalId, "approval id");
+  const { path, status, answeredBy } = await resolveQuestionPacket(
+    rootInput, id, sourceFile, mode, { approvalId },
+  );
+  return { path, status, answeredBy };
+}
+
+export async function approveQuestionFromOperator(
+  root: string,
+  id: string,
+  sourceFile: string,
+  mode: QuestionAnswerMode,
+  operator: { name: string; reviewedContent: string },
+): Promise<{ path: string; status: "active"; answeredBy: string; approvalId: string }> {
+  if (!operator.name.trim()) throw new PortfolioError("operator identity is empty");
+  return resolveQuestionPacket(root, id, sourceFile, mode, { operator });
+}
+
+async function resolveQuestionPacket(
+  rootInput: string,
+  id: string,
+  sourceFile: string,
+  mode: QuestionAnswerMode,
+  authority: { approvalId: string } | { operator: { name: string; reviewedContent: string } },
+): Promise<{ path: string; status: "active"; answeredBy: string; approvalId: string }> {
+  assertId(id, "question packet id");
   if (!["guided", "markdown", "chat"].includes(mode)) {
     throw new PortfolioError(`invalid question answer mode: ${mode}`);
   }
   const root = resolve(rootInput);
   const content = await readFile(resolve(sourceFile), "utf8");
+  if ("operator" in authority && content !== authority.operator.reviewedContent) {
+    throw new PortfolioError("answer file changed after operator review");
+  }
   const parsed = parseQuestionDocument(content);
 
   return withLock(root, async () => {
@@ -904,11 +931,17 @@ export async function answerQuestionPacket(
       throw new PortfolioError("every generated question requires a human answer");
     }
 
-    // The answerer comes from a matching, unconsumed approval record.
-    // No agent-facing CLI subcommand mints one. This models the protocol shape;
-    // protecting records from agent writes requires an external write boundary
-    // or a signature made with a key the agent does not hold.
-    const approval = await readHumanApproval(root, approvalId);
+    const approval: HumanApprovalRecord = "approvalId" in authority
+      ? await readHumanApproval(root, authority.approvalId)
+      : {
+          schemaVersion: 1,
+          id: randomUUID(),
+          packet: id,
+          answeredBy: authority.operator.name,
+          source: "human-surface",
+          recordedAt: new Date().toISOString(),
+        };
+    const approvalId = approval.id;
     if (approval.source !== "human-surface") {
       throw new PortfolioError(
         `approval ${approvalId} is not backed by a human-approval surface`,
@@ -951,7 +984,7 @@ export async function answerQuestionPacket(
       `${JSON.stringify({ ...approval, consumed: true, consumedAt: now }, null, 2)}\n`,
     );
     await setSessionStatus(loaded, packet.intent, packet.project, "active");
-    return { path: questionDocumentPath(root, id), status: "active", answeredBy };
+    return { path: questionDocumentPath(root, id), status: "active", answeredBy, approvalId };
   });
 }
 

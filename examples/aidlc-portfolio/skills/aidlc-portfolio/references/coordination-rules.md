@@ -62,33 +62,22 @@ Generated AI-DLC questions are immutable, human-owned decision points.
    packets are rejected and the session becomes `waiting`.
 2. The supervisor offers Guide, Edit Markdown, or Chat.
 3. The supervisor writes human answers verbatim without changing question text.
-4. The human actions CAO's human-approval surface, which mints an approval
-   record bound to the packet and carrying the human's identity. No
-   agent-facing `portfolio.ts` subcommand mints an approval record.
-5. `question answer --approval-id <id>` verifies question integrity and complete
-   answers, then binds the resolution to that approval: the answerer identity
-   comes FROM the approval record, not from a caller-supplied argument. A
-   packet with no matching, unconsumed, human-surface approval is refused, so
-   the agent cannot resolve a packet by asserting an identity through the
-   `question answer` flag. A replayed answer stops at the packet's status
-   gate, because an answered packet is no longer `pending`; the approval's
-   consumed flag is a second, defense-in-depth check.
+4. The human reviews and confirms the Markdown in their own terminal with
+   `operator-answer.ts`, which records the local OS account and resolves the
+   packet. An external human-approval surface may also issue a record for use
+   with `question answer`. A chat reply by itself does not issue a record.
+   The supervisor and runner must leave confirmation to the human operator.
+5. Both resolution paths validate question integrity and require every answer.
+   The external path requires a matching, unconsumed approval ID. The
+   terminal path binds the approved content to the local operator account.
+   An answered packet cannot be resolved again.
 6. The runner resumes only after observing the answered packet.
 
-In this sample the approval record is a JSON file in `portfolio/approvals/`,
-the same tree the agent's own filesystem tools can already write to. The real
-boundary here is narrower than it looks: no `portfolio.ts` subcommand lets an
-agent mint an approval, but nothing stops an agent with raw file access from
-writing an approval record directly and then calling `question answer` with
-its id. The sample demonstrates the protocol *shape* — packet-bound, single-use,
-identity read from the record rather than a free-text argument — which is a
-real improvement over `--answered-by`. Enforcing that boundary against an
-agent that can write anywhere in its own worktree requires the approval record
-to live outside the agent's write reach (CAO's real human-approval surface) or
-be signed with a key the agent does not hold. The "never answer on the human's
-behalf" prompt rule stays in the profiles as the practical guardrail in this
-sample; treat it as defense-in-depth, not as something the file-based stand-in
-makes structurally unbreakable.
+The sample stores approval records in `portfolio/approvals/`. The interactive
+prompt is an operator workflow. A process running under the same OS account
+can start a pseudo-terminal or write to the workspace. Deployments that need
+to enforce a separate human trust boundary require a protected approval
+service or records signed with a key outside the agent's reach.
 
 ## Shared Memory
 
