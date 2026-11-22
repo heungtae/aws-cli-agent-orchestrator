@@ -10,6 +10,7 @@ import {
 import {
   advanceLifecycle,
   answerQuestionPacket,
+  approveQuestionFromOperator,
   promoteLearningProposal,
   confirmDiscovery,
   PortfolioError,
@@ -542,6 +543,44 @@ describe("portfolio workspace", () => {
     );
     expect(stateCompleted.activeIntent).toBeNull();
   }, 20_000);
+
+  test("operator approval binds the reviewed content and resumes the waiting session", async () => {
+    const root = await temporaryRoot();
+    const { answered } = await waitingQuestionPacket(root, "operator-review");
+    const reviewedContent = await readFile(answered, "utf8");
+    const name = "local-operator";
+    const command = new URL(
+      "../skills/aidlc-portfolio/scripts/operator-answer.ts",
+      import.meta.url,
+    ).pathname;
+    const piped = Bun.spawn(
+      ["bun", command, "--root", root, "--id", "operator-review", "--file", answered, "--mode", "chat"],
+      { stdin: new Response("approve\n"), stdout: "pipe", stderr: "pipe" },
+    );
+    expect(await piped.exited).toBe(1);
+    expect(await new Response(piped.stderr).text()).toContain("requires an interactive terminal");
+
+    await expect(approveQuestionFromOperator(root, "operator-review", answered, "chat", {
+      name,
+      reviewedContent: reviewedContent + "changed",
+    })).rejects.toThrow("changed after operator review");
+    expect(await listQuestionPackets(root, "api", "feature", "pending")).toHaveLength(1);
+
+    const resolved = await approveQuestionFromOperator(root, "operator-review", answered, "chat", {
+      name,
+      reviewedContent,
+    });
+    expect(resolved.status).toBe("active");
+    expect(await readFile(resolved.path, "utf8")).toBe(reviewedContent);
+    const record = JSON.parse(
+      await readFile(join(root, "portfolio/approvals", resolved.approvalId + ".json"), "utf8"),
+    );
+    expect(record).toMatchObject({ packet: "operator-review", consumed: true, answeredBy: name });
+    await expect(approveQuestionFromOperator(root, "operator-review", answered, "chat", {
+      name,
+      reviewedContent,
+    })).rejects.toThrow("already answered");
+  });
 
   test("refuses a consumed approval for a packet restored to pending", async () => {
     const root = await temporaryRoot();
