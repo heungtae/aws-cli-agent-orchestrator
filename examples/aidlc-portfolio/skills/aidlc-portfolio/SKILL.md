@@ -156,8 +156,13 @@ revision, and staging time. The default overlay pins the Claude `opus[1m]`
 alias to `global.anthropic.claude-opus-5[1m]`. Use `--project` and `--intent`
 to sync or verify a subset.
 
-Never bypass a tracked-path refusal. Reconcile project-owned `.claude/` or
-`aidlc/` content explicitly before retrying.
+Never bypass a tracked-path refusal for a portfolio-managed project.
+If a repository commits and maintains its own compatible AI-DLC distribution,
+set `harnessMode: project-managed` in its project registration. The setting
+applies to every intent for that project. Project-managed sync verifies the
+repository's committed distribution manifest, required entrypoints, and file
+hashes without writing to the worktree or using the staged distribution.
+Projects without this setting use the portfolio-managed distribution.
 
 ## Dispatch
 

@@ -5,6 +5,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   writeFile,
@@ -44,6 +45,7 @@ interface RegisteredWorktree {
   project: string;
   intent: string;
   path: string;
+  harnessMode?: "project-managed";
 }
 
 export interface HarnessVerification {
@@ -57,6 +59,7 @@ export interface HarnessVerification {
     intent: string;
     path: string;
     ok: boolean;
+    manifestRevision?: string;
     errors: string[];
   }>;
 }
@@ -173,24 +176,31 @@ export async function syncHarness(
   intent?: string,
 ): Promise<{
   changed: boolean;
-  manifestRevision: string;
+  manifestRevision: string | null;
   worktrees: Array<RegisteredWorktree & { changed: boolean }>;
 }> {
   const provider = requireProvider(providerInput);
   const root = resolve(rootInput);
-  const staged = harnessRoot(root, provider);
-  const manifest = await requireCleanStagedHarness(staged);
-  const manifestRevision = revisionOf(manifest);
   const worktrees = await registeredWorktrees(root, project, intent);
   if (worktrees.length === 0) {
     throw new HarnessError("no registered worktrees match the requested filters");
   }
+  const staged = harnessRoot(root, provider);
+  const manifest = worktrees.some((item) => !item.harnessMode)
+    ? await requireCleanStagedHarness(staged)
+    : null;
+  const manifestRevision = manifest ? revisionOf(manifest) : null;
 
+  for (const worktree of worktrees) {
+    if (worktree.harnessMode) await verifyProjectHarness(worktree.path, provider);
+  }
   const results = [];
   for (const worktree of worktrees) {
     results.push({
       ...worktree,
-      changed: await syncWorktree(worktree.path, staged, manifest, manifestRevision),
+      changed: worktree.harnessMode
+        ? false
+        : await syncWorktree(worktree.path, staged, manifest!, manifestRevision!),
     });
   }
   return {
@@ -213,33 +223,43 @@ export async function verifyHarness(
   const errors: string[] = [];
   let manifest: HarnessManifest | null = null;
 
+  let worktrees: RegisteredWorktree[] = [];
   try {
-    manifest = await requireCleanStagedHarness(staged);
-    const sourceFiles = await distributionFiles(manifest.source.path);
-    const sourceRevision = await sourceRevisionFor(manifest.source.path, sourceFiles);
-    if (
-      sourceRevision !== manifest.source.revision ||
-      !mapsEqual(sourceFiles, manifest.source.files)
-    ) {
-      errors.push(`source harness changed: ${manifest.source.path}`);
+    worktrees = await registeredWorktrees(root, project, intent);
+    if (worktrees.length === 0) {
+      errors.push("no registered worktrees match the requested filters");
     }
   } catch (error) {
     errors.push(errorMessage(error));
   }
+  if (worktrees.some((item) => !item.harnessMode)) {
+    try {
+      manifest = await requireCleanStagedHarness(staged);
+      const sourceFiles = await distributionFiles(manifest.source.path);
+      const sourceRevision = await sourceRevisionFor(manifest.source.path, sourceFiles);
+      if (
+        sourceRevision !== manifest.source.revision ||
+        !mapsEqual(sourceFiles, manifest.source.files)
+      ) {
+        errors.push(`source harness changed: ${manifest.source.path}`);
+      }
+    } catch (error) {
+      errors.push(errorMessage(error));
+    }
+  }
 
   const manifestRevision = manifest ? revisionOf(manifest) : null;
   const worktreeResults: HarnessVerification["worktrees"] = [];
-  if (manifest) {
-    const worktrees = await registeredWorktrees(root, project, intent);
-    if (worktrees.length === 0) {
-      errors.push("no registered worktrees match the requested filters");
-    }
-    for (const worktree of worktrees) {
-      const worktreeErrors = await verifyWorktree(
-        worktree.path,
-        manifest,
-        manifestRevision!,
-      );
+  for (const worktree of worktrees) {
+    if (worktree.harnessMode) {
+      try {
+        const revision = await verifyProjectHarness(worktree.path, provider);
+        worktreeResults.push({ ...worktree, ok: true, manifestRevision: revision, errors: [] });
+      } catch (error) {
+        worktreeResults.push({ ...worktree, ok: false, errors: [errorMessage(error)] });
+      }
+    } else if (manifest) {
+      const worktreeErrors = await verifyWorktree(worktree.path, manifest, manifestRevision!);
       worktreeResults.push({
         ...worktree,
         ok: worktreeErrors.length === 0,
@@ -256,6 +276,72 @@ export async function verifyHarness(
     errors,
     worktrees: worktreeResults,
   };
+}
+
+// AI-DLC distribution manifest v1 is the project-managed compatibility contract.
+async function verifyProjectHarness(worktree: string, provider: string): Promise<string> {
+  await requireGitWorktree(worktree);
+  const runtime = `.${provider}`;
+  const manifestPath = `${runtime}/tools/data/aidlc-manifest.json`;
+  const canonicalRoot = await realpath(worktree);
+  const readProjectFile = async (path: string): Promise<Buffer> => {
+    const absolute = join(canonicalRoot, path);
+    if (!(await lstat(absolute)).isFile() || await realpath(absolute) !== absolute) {
+      throw new HarnessError(`project harness path must be a regular file: ${path}`);
+    }
+    return readFile(absolute);
+  };
+
+  const head = (await gitOutput(worktree, ["rev-parse", "HEAD"])).trim();
+  const committed = await gitOutput(worktree, ["show", `${head}:${manifestPath}`]);
+  const installed = (await readProjectFile(manifestPath)).toString("utf8");
+  if (installed !== committed) {
+    throw new HarnessError(`project harness manifest differs from HEAD: ${manifestPath}`);
+  }
+
+  const manifest = JSON.parse(installed);
+  if (
+    manifest?.schemaVersion !== 1 ||
+    manifest.distribution !== provider ||
+    manifest.harnessDir !== runtime ||
+    typeof manifest.frameworkVersion !== "string" ||
+    !manifest.frameworkVersion ||
+    !manifest.files || typeof manifest.files !== "object" || Array.isArray(manifest.files)
+  ) {
+    throw new HarnessError(`unsupported project harness manifest for ${provider}: ${manifestPath}`);
+  }
+
+  const skills = provider === "codex" ? ".agents" : runtime;
+  const required = [
+    `${runtime}/${provider === "codex" ? "config.toml" : "settings.json"}`,
+    `${skills}/skills/aidlc/SKILL.md`,
+    `${runtime}/tools/aidlc.ts`,
+    `${runtime}/tools/aidlc-orchestrate.ts`,
+  ];
+  for (const path of required) {
+    if (!Object.hasOwn(manifest.files, path)) {
+      throw new HarnessError(`project harness manifest is missing required path: ${path}`);
+    }
+  }
+
+  for (const [path, expected] of Object.entries(manifest.files)) {
+    if (
+      ![runtime, skills, "aidlc"].some((dir) => path.startsWith(`${dir}/`)) ||
+      path.split("/").some((part) => !part || part === "." || part === "..") ||
+      /[\\\x00-\x1f]/.test(path) ||
+      typeof expected !== "string" || !/^sha256:[0-9a-f]{64}$/.test(expected)
+    ) {
+      throw new HarnessError(`invalid project harness manifest entry: ${JSON.stringify(path)}`);
+    }
+    const actual = createHash("sha256").update(await readProjectFile(path)).digest("hex");
+    if (`sha256:${actual}` !== expected) {
+      throw new HarnessError(`project harness file hash mismatch: ${path}`);
+    }
+  }
+  if ((await gitOutput(worktree, ["rev-parse", "HEAD"])).trim() !== head) {
+    throw new HarnessError("worktree HEAD changed during project harness verification");
+  }
+  return revisionOf({ head, manifest });
 }
 
 async function syncWorktree(
@@ -371,6 +457,19 @@ async function registeredWorktrees(
     .sort();
   const worktrees: RegisteredWorktree[] = [];
   const owners = new Map<string, string>();
+  const projects = join(root, "portfolio", "projects");
+  const registrations = new Map<string, unknown>();
+  for (const name of (await readdir(projects)).sort()) {
+    if (!/\.ya?ml$/.test(name)) continue;
+    const project = parse(await readFile(join(projects, name), "utf8")) as {
+      id?: string;
+      harnessMode?: unknown;
+    };
+    if (!project?.id || registrations.has(project.id)) {
+      throw new HarnessError(`invalid or duplicate project registration: ${name}`);
+    }
+    registrations.set(project.id, project.harnessMode);
+  }
   for (const name of names) {
     const document = parse(await readFile(join(directory, name), "utf8")) as {
       id?: string;
@@ -380,6 +479,14 @@ async function registeredWorktrees(
       if (!document.id || !mapping.project || !mapping.worktree) continue;
       if (projectFilter && mapping.project !== projectFilter) continue;
       if (intentFilter && document.id !== intentFilter) continue;
+      if (!registrations.has(mapping.project)) {
+        throw new HarnessError(`project is not registered: ${mapping.project}`);
+      }
+      const mode = registrations.get(mapping.project);
+      if (mode !== undefined && mode !== "project-managed" && mode !== "portfolio-managed") {
+        throw new HarnessError(`invalid harnessMode for project ${mapping.project}`);
+      }
+      const harnessMode = mode === "project-managed" ? mode : undefined;
       const path = resolveInside(root, mapping.worktree, join(root, "worktrees"));
       const owner = `${document.id}:${mapping.project}`;
       const previousOwner = owners.get(path);
@@ -393,6 +500,7 @@ async function registeredWorktrees(
         project: mapping.project,
         intent: document.id,
         path,
+        ...(harnessMode ? { harnessMode } : {}),
       });
     }
   }

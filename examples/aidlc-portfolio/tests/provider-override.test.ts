@@ -20,6 +20,8 @@ test('Codex projection detects drift and protects tracked paths', async () => {
   }
   await git('init');
   await mkdir(join(root, 'portfolio/intents'), { recursive: true });
+  await mkdir(join(root, 'portfolio/projects'), { recursive: true });
+  await writeFile(join(root, 'portfolio/projects/api.yaml'), 'id: api\n');
   await writeFile(join(root, 'portfolio/intents/f.yaml'), 'id: f\nprojects:\n  - project: api\n    worktree: worktrees/api\n');
   expect((await h.stageHarness(root, 'codex', source)).changed).toBe(true);
   expect((await h.stageHarness(root, 'codex', source)).changed).toBe(false);
