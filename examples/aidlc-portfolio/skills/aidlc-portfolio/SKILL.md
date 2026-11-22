@@ -301,9 +301,20 @@ bun "$SKILL_DIR/scripts/portfolio.ts" question submit \
 Submission rejects any pre-filled answer and moves the session to `waiting`.
 The runner reports the packet and stops. It must never invoke `question answer`.
 
-The human actions CAO's human-approval surface to resolve the packet. That
-surface — not any agent-facing command — mints an approval record bound to the
-packet, carrying the human's verified identity. Resolve with that approval:
+Give the operator the packet ID and the absolute path to the answered
+Markdown. The operator runs this command from their own terminal, reviews
+the displayed Markdown, and types `approve`:
+
+```bash
+bun "$SKILL_DIR/runtimes/<provider>/scripts/operator-answer.ts" \
+  --root <root> --id <packet-id> --file <answered.md> --mode chat
+```
+
+Use `claude` or `codex` for `<provider>` in an override installation. For the
+original skill, the entry point is `$SKILL_DIR/scripts/operator-answer.ts`.
+The operator tool records the local OS account and resolves the packet.
+The supervisor and Runner must leave this command to the human operator.
+For external integrations that already issue approval records, use:
 
 ```bash
 bun "$SKILL_DIR/scripts/portfolio.ts" question answer \
