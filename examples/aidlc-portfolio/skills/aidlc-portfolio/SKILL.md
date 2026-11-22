@@ -52,10 +52,10 @@ items. Perform setup on their behalf:
    portfolio intent per independent work item using templates and utility
    commands.
 6. Create each worktree through `worktree create`.
-7. Locate the Claude AI-DLC distribution at
-   `$HOME/Project/aidlc-workflows/dist/claude`. Run `harness stage`, `harness
-   sync`, and `harness verify` to project one manifest-pinned Opus 5 runtime
-   into every worktree.
+7. For portfolio-managed projects, locate the AI-DLC distribution matching
+   the installed runner provider. Run `harness stage`, `harness sync`, and
+   `harness verify`. For project-managed projects, validate the committed
+   harness with `harness verify`.
 8. Run `doctor` and `dispatch check`, render each assignment with
    `dispatch message`, then assign all dependency-ready `aidlc_runner`
    sessions concurrently with CAO `working_directory` set to each absolute
@@ -139,8 +139,9 @@ Before worktree creation, ensure the registered path exists under
 ## Harness Lifecycle
 
 Read [harness-lifecycle.md](references/harness-lifecycle.md) before staging or
-updating child runtimes. Stage the source distribution after registering
-intents and creating their worktrees:
+updating child runtimes. For portfolio-managed projects, stage the source distribution matching the
+installed runner provider after creating their worktrees. For example, for a
+Claude runner:
 
 ```bash
 bun "$SKILL_DIR/scripts/portfolio.ts" harness stage \
@@ -152,8 +153,10 @@ bun "$SKILL_DIR/scripts/portfolio.ts" harness verify --root <root>
 ```
 
 The staged manifest records source revision, source and staged hashes, overlay
-revision, and staging time. The default overlay pins the Claude `opus[1m]`
-alias to `global.anthropic.claude-opus-5[1m]`. Use `--project` and `--intent`
+revision, and staging time. The Claude overlay pins the `opus[1m]` alias to
+`global.anthropic.claude-opus-5[1m]`. For Codex, stage a Codex distribution
+containing `.codex/config.toml`, `.agents/skills/aidlc/SKILL.md`, and `aidlc/`.
+The Codex runner profile selects the model. Use `--project` and `--intent`
 to sync or verify a subset.
 
 Never bypass a tracked-path refusal for a portfolio-managed project.
