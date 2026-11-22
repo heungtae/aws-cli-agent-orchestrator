@@ -306,3 +306,19 @@ This example does not:
 - share one mutable AI-DLC state directory between children;
 - automatically approve human design or integration decisions;
 - reuse, clean, reset, or delete an existing user checkout.
+
+### Repository-managed AI-DLC harnesses
+
+Set `harnessMode: project-managed` in the project registration YAML when the
+repository commits its own AI-DLC distribution. The default is
+`portfolio-managed`, which uses the staged distribution and existing
+tracked-path protection.
+
+Project-managed worktrees use the active provider's installed AI-DLC skill and
+engine. Portfolio checks the v1 distribution manifest at
+`.<provider>/tools/data/aidlc-manifest.json` against the worktree's HEAD,
+requires the provider config, skill, and engine entrypoints, and verifies
+the hashes listed by the manifest. Runner assignments carry a revision derived
+from the manifest and commit. Sync validates these worktrees without writing
+to them or requiring a staged distribution. Commit runtime upgrades together
+with their updated distribution manifest.

@@ -1255,7 +1255,8 @@ async function assertDispatchable(
     throw new PortfolioError(`worktree does not exist: ${worktree}`);
   }
   const harness = await verifyHarness(root, "claude", projectId, intentId);
-  if (!harness.ok || !harness.manifestRevision) {
+  const harnessRevision = harness.worktrees[0]?.manifestRevision ?? harness.manifestRevision;
+  if (!harness.ok || !harnessRevision) {
     const details = [
       ...harness.errors,
       ...harness.worktrees.flatMap((item) =>
@@ -1276,7 +1277,7 @@ async function assertDispatchable(
     branch: mapping.branch,
     aidlcIntent: mapping.aidlcIntent,
     aidlcSpace,
-    harnessManifestRevision: harness.manifestRevision,
+    harnessManifestRevision: harnessRevision,
   };
 }
 
