@@ -1465,6 +1465,7 @@ async function runCli(args: string[]): Promise<{
     ...args,
   ], {
     cwd: join(import.meta.dir, ".."),
+    env: { ...process.env, AIDLC_RUNNER_PROFILE: join(import.meta.dir, "../aidlc_runner.md") },
     stdout: "pipe",
     stderr: "pipe",
   });

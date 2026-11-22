@@ -109,12 +109,20 @@ The deterministic utility provides:
 - `cao-server` running.
 - Bun 1.3 or later.
 - Git.
-- Claude Code installed and authenticated.
-- A built Claude AI-DLC distribution at
-  `$HOME/Project/aidlc-workflows/dist/claude`.
+- The configured agent CLIs installed and authenticated.
+- For portfolio-managed projects, an AI-DLC distribution matching the installed
+  `aidlc_runner` profile (`claude_code` or `codex`).
 
-The profiles use Claude Code's `opus` selector. The harness projection pins the
-child runtime to the configured Opus 5 model identifier.
+The sample profiles use Claude Code. For Codex, set `provider: codex` and a
+compatible model in the runner profile before installing it. Portfolio reads
+the installed profile from `$CAO_HOME_DIR/agent-store/aidlc_runner.md`
+(default CAO home is `~/.aws/cli-agent-orchestrator`). For local tests,
+`AIDLC_RUNNER_PROFILE` can point to another profile. A supplied `--provider`
+must agree with the profile when one exists. Without an installed profile,
+the CLI accepts the supplied provider or defaults to Claude.
+
+Claude staging applies the Opus model overlay. Codex staging preserves
+`.codex/config.toml` and leaves model selection to the runner profile.
 
 Both profiles explicitly allow CAO orchestration, shell execution, and
 workspace file access because they must run the deterministic utility and write
@@ -144,6 +152,17 @@ cao install ./aidlc_runner.md
 
 Use `cao skills add ./skills/aidlc-portfolio --force` when intentionally
 updating an earlier installation.
+
+### Migrate a legacy override installation
+
+Install or update the managed `aidlc-portfolio` skill with the commands above.
+In the local `aidlc_runner.md` and `aidlc_portfolio_supervisor.md` files under
+CAO's `agent-store/` and `agent-context/`, remove the generated
+`## Installed provider override` section and point any remaining legacy
+skill paths to `skills/aidlc-portfolio`. Preserve your provider and model
+settings. Restart the supervisor and use the managed skill's
+`scripts/portfolio.ts` entrypoint. Existing Portfolio workspaces and
+project registrations can be reused.
 
 Validate the installation source:
 

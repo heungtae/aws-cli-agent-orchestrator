@@ -79,11 +79,11 @@ derive or create another nested portfolio root. Create a fresh canonical
 checkout under `repositories/`, register the project and one portfolio intent
 per independent work item, then create isolated worktrees.
 
-Discover the Claude AI-DLC distribution at
-`$HOME/Project/aidlc-workflows/dist/claude`. Use `harness stage` to create one
-manifest-pinned Opus 5 copy, `harness sync` to project it into each child
-worktree, and `harness verify` before every dispatch. Never copy harness files
-directly or bypass a tracked-path refusal.
+For portfolio-managed projects, discover the AI-DLC distribution matching
+the installed `aidlc_runner` provider. Use `harness stage` and `harness sync`
+to project it into each child worktree. Project-managed worktrees use their
+committed distribution. Run `harness verify` before every dispatch. Use the
+managed `aidlc-portfolio` skill and retain tracked-path protection.
 
 Run portfolio doctor and dispatch checks, render each assignment with
 `dispatch message` from a fresh `memory_recall` of your own scope, then launch

@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 
 import { readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { parse } from "yaml";
 import { resolve } from "node:path";
 import {
   advanceLifecycle,
@@ -32,7 +34,9 @@ import {
   type SessionStatus,
 } from "./lib.ts";
 import {
+  requireProvider,
   stageHarness,
+  type HarnessProvider,
   syncHarness,
   verifyHarness,
 } from "./harness.ts";
@@ -84,7 +88,7 @@ async function main(argv: string[]): Promise<void> {
       return;
     }
     case "status":
-      printJson(await portfolioStatus(root));
+      printJson(await portfolioStatus(root, await selectProvider(options)));
       return;
     case "result submit":
       printJson({
@@ -114,7 +118,7 @@ async function main(argv: string[]): Promise<void> {
       printJson({ ok: true, ...(await migrateLifecycle(root)) });
       return;
     case "lifecycle status":
-      printJson({ ok: true, ...(await lifecycleStatus(root)) });
+      printJson({ ok: true, ...(await lifecycleStatus(root, await selectProvider(options))) });
       return;
     case "lifecycle advance":
       printJson({
@@ -123,6 +127,7 @@ async function main(argv: string[]): Promise<void> {
           root,
           required(options, "to"),
           optional(options, "accepted-by") ?? optional(options, "actor"),
+          await selectProvider(options),
         )),
       });
       return;
@@ -137,12 +142,9 @@ async function main(argv: string[]): Promise<void> {
         ok: true,
         ...(await stageHarness(
           root,
-          String(options.provider ?? "claude"),
+          await selectProvider(options),
           required(options, "source"),
-          String(
-            options["opus-model"] ??
-              "global.anthropic.claude-opus-5[1m]",
-          ),
+          options["opus-model"] === undefined ? undefined : required(options, "opus-model"),
         )),
       });
       return;
@@ -151,7 +153,7 @@ async function main(argv: string[]): Promise<void> {
         ok: true,
         ...(await syncHarness(
           root,
-          String(options.provider ?? "claude"),
+          await selectProvider(options),
           optional(options, "project"),
           optional(options, "intent"),
         )),
@@ -160,7 +162,7 @@ async function main(argv: string[]): Promise<void> {
     case "harness verify": {
       const result = await verifyHarness(
         root,
-        String(options.provider ?? "claude"),
+        await selectProvider(options),
         optional(options, "project"),
         optional(options, "intent"),
       );
@@ -292,6 +294,7 @@ async function main(argv: string[]): Promise<void> {
           root,
           required(options, "project"),
           required(options, "intent"),
+          await selectProvider(options),
         )),
       });
       return;
@@ -312,6 +315,7 @@ async function main(argv: string[]): Promise<void> {
             ? await readFile(resolve(contractsFile), "utf8")
             : undefined,
         },
+        await selectProvider(options),
       );
       await writeFile(out, message);
       printJson({ ok: true, path: out, learnings });
@@ -328,6 +332,7 @@ async function main(argv: string[]): Promise<void> {
         required(options, "project"),
         status,
         optional(options, "terminal"),
+        status === "active" ? await selectProvider(options) : undefined,
       );
       printJson({ ok: true });
       return;
@@ -372,6 +377,30 @@ function parseCommand(argv: string[]): { command: string; options: Options } {
   return { command, options };
 }
 
+async function selectProvider(options: Options): Promise<HarnessProvider> {
+  const explicit = options.provider === undefined ? undefined : requireProvider(required(options, "provider"));
+  const profileOverride = process.env.AIDLC_RUNNER_PROFILE;
+  const caoHome = process.env.CAO_HOME_DIR?.trim() || resolve(homedir(), ".aws/cli-agent-orchestrator");
+  const profile = profileOverride ?? resolve(caoHome, "agent-store/aidlc_runner.md");
+  let content: string;
+  try {
+    content = await readFile(profile, "utf8");
+  } catch (error) {
+    if (!profileOverride && (error as NodeJS.ErrnoException).code === "ENOENT") {
+      return explicit ?? "claude";
+    }
+    throw error;
+  }
+  const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!frontmatter?.[1]) throw new PortfolioError(`Runner profile has no YAML frontmatter: ${profile}`);
+  const configured = parse(frontmatter[1])?.provider;
+  const provider = requireProvider(configured === "claude_code" ? "claude" : configured);
+  if (explicit && explicit !== provider) {
+    throw new PortfolioError("--provider conflicts with runner profile");
+  }
+  return provider;
+}
+
 function required(options: Options, key: string): string {
   const value = options[key];
   if (typeof value !== "string" || !value) {
@@ -414,9 +443,9 @@ Usage:
   portfolio.ts lifecycle status --root PATH
   portfolio.ts lifecycle advance --root PATH --to PHASE [--accepted-by HUMAN] [--actor NAME]
   portfolio.ts lifecycle complete --root PATH [--actor NAME]
-  portfolio.ts harness stage --root PATH --source PATH [--provider claude] [--opus-model MODEL]
-  portfolio.ts harness sync --root PATH [--provider claude] [--project ID] [--intent ID]
-  portfolio.ts harness verify --root PATH [--provider claude] [--project ID] [--intent ID]
+  portfolio.ts harness stage --root PATH --source PATH [--provider claude|codex] [--opus-model MODEL]
+  portfolio.ts harness sync --root PATH [--provider claude|codex] [--project ID] [--intent ID]
+  portfolio.ts harness verify --root PATH [--provider claude|codex] [--project ID] [--intent ID]
   portfolio.ts project register --root PATH --file FILE
   portfolio.ts discovery confirm --root PATH --file FILE
   portfolio.ts dependency add --root PATH --file FILE

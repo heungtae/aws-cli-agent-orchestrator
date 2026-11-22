@@ -13,7 +13,7 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import { checkConvergence } from "./convergence.ts";
-import { verifyHarness } from "./harness.ts";
+import { verifyHarness, type HarnessProvider } from "./harness.ts";
 
 export type DocumentKind = "project" | "dependency" | "intent";
 export type MemoryDestination = "project" | "team";
@@ -560,7 +560,7 @@ export async function doctorWorkspace(rootInput: string): Promise<ValidationResu
   return result;
 }
 
-export async function portfolioStatus(rootInput: string) {
+export async function portfolioStatus(rootInput: string, provider: HarnessProvider = "claude") {
   const loaded = await loadWorkspace(resolve(rootInput));
   const learnings = await readLearningProposals(loaded.root);
   const questions = await listQuestionPackets(loaded.root);
@@ -575,7 +575,7 @@ export async function portfolioStatus(rootInput: string) {
       status: loaded.portfolio.status,
     },
     activeIntent: loaded.state.activeIntent,
-    lifecycle: await lifecycleSummary(loaded),
+    lifecycle: await lifecycleSummary(loaded, provider),
     counts: {
       projects: loaded.projects.length,
       dependencies: loaded.dependencies.length,
@@ -639,15 +639,16 @@ export async function migrateLifecycle(
   });
 }
 
-export async function lifecycleStatus(rootInput: string) {
+export async function lifecycleStatus(rootInput: string, provider: HarnessProvider = "claude") {
   const loaded = await loadWorkspace(resolve(rootInput));
-  return lifecycleSummary(loaded);
+  return lifecycleSummary(loaded, provider);
 }
 
 export async function advanceLifecycle(
   rootInput: string,
   targetInput: string,
   actor?: string,
+  provider: HarnessProvider = "claude",
 ): Promise<{
   changed: boolean;
   phase: PortfolioPhase;
@@ -663,7 +664,7 @@ export async function advanceLifecycle(
     }
     if (target === lifecycle.phase) {
       if (target === "dispatch" && actor?.trim()) {
-        const blockers = await transitionBlockers(root, loaded, target, actor);
+        const blockers = await transitionBlockers(root, loaded, target, actor, provider);
         if (blockers.length > 0) {
           throw new PortfolioError(
             `cannot accept the current dispatch plan:\n${blockers
@@ -711,7 +712,7 @@ export async function advanceLifecycle(
       );
     }
 
-    const blockers = await transitionBlockers(root, loaded, target, actor);
+    const blockers = await transitionBlockers(root, loaded, target, actor, provider);
     if (blockers.length > 0) {
       throw new PortfolioError(
         `cannot advance lifecycle from ${lifecycle.phase} to ${target}:\n${blockers
@@ -1100,6 +1101,7 @@ export async function updateSession(
   projectId: string,
   status: SessionStatus,
   terminalId?: string,
+  provider: HarnessProvider = "claude",
 ): Promise<void> {
   const root = resolve(rootInput);
   await withLock(root, async () => {
@@ -1110,7 +1112,7 @@ export async function updateSession(
       throw new PortfolioError(`intent ${intentId} does not contain project ${projectId}`);
     }
     if (status === "active") {
-      await assertDispatchable(root, loaded, mapping, projectId, intentId);
+      await assertDispatchable(root, loaded, mapping, projectId, intentId, provider);
     }
     if (status === "completed") {
       const pendingQuestions = await listQuestionPackets(
@@ -1213,6 +1215,7 @@ export async function checkDispatch(
   rootInput: string,
   projectId: string,
   intentId: string,
+  provider: HarnessProvider = "claude",
 ): Promise<DispatchReadiness> {
   const root = resolve(rootInput);
   const validation = await doctorWorkspace(root);
@@ -1226,7 +1229,7 @@ export async function checkDispatch(
   if (!intent || !mapping) {
     throw new PortfolioError(`project ${projectId} is not registered in intent ${intentId}`);
   }
-  return assertDispatchable(root, loaded, mapping, projectId, intentId);
+  return assertDispatchable(root, loaded, mapping, projectId, intentId, provider);
 }
 
 async function assertDispatchable(
@@ -1235,6 +1238,7 @@ async function assertDispatchable(
   mapping: IntentProject,
   projectId: string,
   intentId: string,
+  provider: HarnessProvider,
 ): Promise<DispatchReadiness> {
   const discovery = await requireConfirmedDiscovery(root, loaded);
   requireLifecyclePhase(loaded, "dispatch");
@@ -1287,7 +1291,7 @@ async function assertDispatchable(
   if (!(await pathExists(worktree))) {
     throw new PortfolioError(`worktree does not exist: ${worktree}`);
   }
-  const harness = await verifyHarness(root, "claude", projectId, intentId);
+  const harness = await verifyHarness(root, provider, projectId, intentId);
   const harnessRevision = harness.worktrees[0]?.manifestRevision ?? harness.manifestRevision;
   if (!harness.ok || !harnessRevision) {
     const details = [
@@ -1325,13 +1329,14 @@ export async function renderRunnerMessage(
   projectId: string,
   intentId: string,
   input: RunnerMessageInput,
+  provider: HarnessProvider = "claude",
 ): Promise<{ message: string; learnings: LearningDelivery }> {
   const callbackTerminal = input.callbackTerminal.trim();
   if (!callbackTerminal || /\s/.test(callbackTerminal)) {
     throw new PortfolioError("callback terminal must be one CAO terminal ID");
   }
   const root = resolve(rootInput);
-  const readiness = await checkDispatch(root, projectId, intentId);
+  const readiness = await checkDispatch(root, projectId, intentId, provider);
   const loaded = await loadWorkspace(root);
   const intent = loaded.intents.find((item) => item.id === intentId)!;
   const proposals = await readLearningProposals(root);
@@ -2006,6 +2011,7 @@ async function hasAidlcHarness(worktree: string): Promise<boolean> {
     ".claude/skills/aidlc/SKILL.md",
     ".kiro/skills/aidlc/SKILL.md",
     ".codex/skills/aidlc/SKILL.md",
+    ".agents/skills/aidlc/SKILL.md",
   ];
   for (const candidate of candidates) {
     if (await pathExists(join(worktree, candidate))) {
@@ -2128,14 +2134,14 @@ async function requireConfirmedDiscovery(
   return decision;
 }
 
-async function lifecycleSummary(loaded: LoadedWorkspace) {
+async function lifecycleSummary(loaded: LoadedWorkspace, provider: HarnessProvider) {
   const lifecycle = loaded.state.lifecycle;
   const nextPhase = NEXT_PHASE[lifecycle.phase];
   let blockers =
     lifecycle.status === "completed"
       ? []
       : nextPhase
-        ? await transitionBlockers(loaded.root, loaded, nextPhase)
+        ? await transitionBlockers(loaded.root, loaded, nextPhase, undefined, provider)
         : await integrationBlockers(loaded.root, loaded);
   let actions =
     lifecycle.status === "completed"
@@ -2172,7 +2178,8 @@ async function transitionBlockers(
   root: string,
   loaded: LoadedWorkspace,
   target: PortfolioPhase,
-  actor?: string,
+  actor: string | undefined,
+  provider: HarnessProvider,
 ): Promise<string[]> {
   const blockers: string[] = [];
   if (target === "discover") {
@@ -2197,7 +2204,7 @@ async function transitionBlockers(
     if (!actor?.trim()) {
       blockers.push("record explicit plan acceptance with --accepted-by <human>");
     }
-    const harness = await verifyHarness(root, "claude");
+    const harness = await verifyHarness(root, provider);
     if (!harness.ok) {
       blockers.push(
         ...harness.errors.map((error) => `harness: ${error}`),

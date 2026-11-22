@@ -33,6 +33,38 @@ afterEach(async () => {
 });
 
 describe("portfolio lifecycle", () => {
+  test("uses the Codex runner profile through lifecycle, dispatch, and activation", async () => {
+    const root = await createFixture("codex");
+    const profile = join(root, "runner.md");
+    const entrypoint = join(import.meta.dir, "../skills/aidlc-portfolio/scripts/portfolio.ts");
+    await writeFile(profile, "---\nprovider: codex\n---\n");
+    const run = async (...args: string[]) => {
+      const proc = Bun.spawn([process.execPath, entrypoint, ...args, "--root", root], {
+        env: { ...process.env, AIDLC_RUNNER_PROFILE: profile },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [code, stdout, stderr] = await Promise.all([
+        proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
+      ]);
+      if (code !== 0) throw new Error(stderr || stdout);
+      return JSON.parse(stdout);
+    };
+
+    await advanceLifecycle(root, "discover");
+    await confirmDefaultDiscovery(root);
+    await advanceLifecycle(root, "confirm");
+    await advanceLifecycle(root, "plan");
+    const status = await run("lifecycle", "status");
+    expect(status.blockers).toEqual(["record explicit plan acceptance with --accepted-by <human>"]);
+    expect(await run("lifecycle", "advance", "--to", "dispatch", "--accepted-by", "Portfolio Owner"))
+      .toMatchObject({ phase: "dispatch" });
+    expect(await run("dispatch", "check", "--project", "api", "--intent", "feature"))
+      .toMatchObject({ ok: true, harnessManifestRevision: expect.any(String) });
+    expect(await run("session", "update", "--project", "api", "--intent", "feature", "--status", "active"))
+      .toMatchObject({ ok: true });
+  });
+
   test("persists guarded transitions and completes idempotently", async () => {
     const root = await createFixture();
     let status = await lifecycleStatus(root);
@@ -194,7 +226,7 @@ describe("portfolio lifecycle", () => {
   });
 });
 
-async function createFixture(): Promise<string> {
+async function createFixture(provider: "claude" | "codex" = "claude"): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "aidlc-portfolio-lifecycle-"));
   temporaryRoots.push(root);
   await initializeWorkspace(root, "sample-portfolio", "Sample Portfolio");
@@ -234,26 +266,19 @@ async function createFixture(): Promise<string> {
   await gitOutput(worktree, ["commit", "-m", "Initial"]);
 
   const source = join(root, "source-distribution");
-  await mkdir(join(source, ".claude/skills/aidlc"), { recursive: true });
+  const skillDirectory = provider === "codex" ? ".agents/skills/aidlc" : ".claude/skills/aidlc";
+  await mkdir(join(source, skillDirectory), { recursive: true });
   await mkdir(join(source, "aidlc"), { recursive: true });
-  await writeFile(
-    join(source, ".claude/settings.json"),
-    `${JSON.stringify(
-      {
-        env: {
-          ANTHROPIC_DEFAULT_OPUS_MODEL:
-            "global.anthropic.claude-opus-5[1m]",
-        },
-        model: "opus[1m]",
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  await writeFile(join(source, ".claude/skills/aidlc/SKILL.md"), "# AI-DLC\n");
+  if (provider === "codex") {
+    await mkdir(join(source, ".codex"), { recursive: true });
+    await writeFile(join(source, ".codex/config.toml"), "# Codex configuration\n");
+  } else {
+    await writeFile(join(source, ".claude/settings.json"), "{}\n");
+  }
+  await writeFile(join(source, skillDirectory, "SKILL.md"), "# AI-DLC\n");
   await writeFile(join(source, "aidlc/version.txt"), "test\n");
-  await stageHarness(root, "claude", source);
-  await syncHarness(root, "claude");
+  await stageHarness(root, provider, source);
+  await syncHarness(root, provider);
   return root;
 }
 

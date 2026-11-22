@@ -1,12 +1,10 @@
 import { test, expect } from 'bun:test';
-import { mkdtemp, mkdir, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { build } from '../overrides/build.ts';
-test('Codex projection detects drift and protects tracked paths', async () => {
+import * as harness from '../skills/aidlc-portfolio/scripts/harness.ts';
+test('Native Codex projection detects drift and protects tracked paths', async () => {
  const root = await mkdtemp('/tmp/portfolio-override-test-');
  try {
-  await build(join(root, 'override'));
-  const h = await import(join(root, 'override/runtimes/codex/scripts/harness.ts'));
   const source = join(root, 'source');
   for (const name of ['.codex', '.agents/skills/aidlc', 'aidlc']) await mkdir(join(source, name), { recursive: true });
   await writeFile(join(source, '.codex/config.toml'), '# config\n');
@@ -23,31 +21,29 @@ test('Codex projection detects drift and protects tracked paths', async () => {
   await mkdir(join(root, 'portfolio/projects'), { recursive: true });
   await writeFile(join(root, 'portfolio/projects/api.yaml'), 'id: api\n');
   await writeFile(join(root, 'portfolio/intents/f.yaml'), 'id: f\nprojects:\n  - project: api\n    worktree: worktrees/api\n');
-  expect((await h.stageHarness(root, 'codex', source)).changed).toBe(true);
-  expect((await h.stageHarness(root, 'codex', source)).changed).toBe(false);
-  await h.syncHarness(root, 'codex');
-  expect((await h.verifyHarness(root, 'codex')).ok).toBe(true);
-  expect((await h.syncHarness(root, 'codex')).changed).toBe(false);
+  expect((await harness.stageHarness(root, 'codex', source)).changed).toBe(true);
+  expect((await harness.stageHarness(root, 'codex', source)).changed).toBe(false);
+  await harness.syncHarness(root, 'codex');
+  expect((await harness.verifyHarness(root, 'codex')).ok).toBe(true);
+  expect((await harness.syncHarness(root, 'codex')).changed).toBe(false);
   await writeFile(join(wt, '.agents/skills/aidlc/SKILL.md'), 'tampered');
-  expect((await h.verifyHarness(root, 'codex')).ok).toBe(false);
-  await h.syncHarness(root, 'codex');
+  expect((await harness.verifyHarness(root, 'codex')).ok).toBe(false);
+  await harness.syncHarness(root, 'codex');
   await git('add', '-f', '.codex/config.toml');
-  await expect(h.syncHarness(root, 'codex')).rejects.toThrow('tracked harness paths');
+  await expect(harness.syncHarness(root, 'codex')).rejects.toThrow('tracked harness paths');
   await writeFile(join(source, 'aidlc/version.txt'), '2');
-  expect((await h.verifyHarness(root, 'codex')).ok).toBe(false);
-  expect(await readFile(join(root, 'override/runtimes/codex/scripts/lib.ts'), 'utf8')).not.toContain('verifyHarness(root, "claude"');
+  expect((await harness.verifyHarness(root, 'codex')).ok).toBe(false);
  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('wrapper selects runner provider for CLI and rejects conflicting flags', async () => {
+test('native CLI selects runner provider for CLI and rejects conflicting flags', async () => {
  const root = await mkdtemp('/tmp/portfolio-profile-test-');
  try {
   const profile = join(root, 'runner.md');
   await writeFile(profile, '---\nprovider: codex\n---\n');
-  const output = join(root, 'override');
-  await build(output, undefined, profile);
+  const entrypoint = join(import.meta.dir, '../skills/aidlc-portfolio/scripts/portfolio.ts');
   async function run(...args: string[]) {
-   const p = Bun.spawn(['bun', join(output, 'scripts/portfolio.ts'), ...args], { stdout: 'pipe', stderr: 'pipe' });
+   const p = Bun.spawn(['bun', entrypoint, ...args], { env: { ...process.env, AIDLC_RUNNER_PROFILE: profile }, stdout: 'pipe', stderr: 'pipe' });
    return { code: await p.exited, out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text() };
   }
   const rejected = await run('harness', 'verify', '--root', root, '--provider', 'claude');
@@ -59,6 +55,6 @@ test('wrapper selects runner provider for CLI and rejects conflicting flags', as
   const claude = await run('harness', 'verify', '--root', root);
   expect(claude.out).toContain('"provider": "claude"');
   await writeFile(profile, '---\nprovider: unknown\n---\n');
-  expect((await run('help')).code).not.toBe(0);
+  expect((await run('harness', 'verify', '--root', root)).code).not.toBe(0);
  } finally { await rm(root, { recursive: true, force: true }); }
 });
