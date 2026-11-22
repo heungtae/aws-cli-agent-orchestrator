@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   mkdtemp,
@@ -151,6 +152,49 @@ describe("portfolio harness lifecycle", () => {
     );
   }, 20_000);
 
+  test("verifies a committed project-managed harness without staging or writes", async () => {
+    const { root, worktree } = await createFixture("project-managed");
+    const files = {
+      ".claude/settings.json": "{}",
+      ".claude/skills/aidlc/SKILL.md": "# AI-DLC",
+      ".claude/tools/aidlc.ts": "export {};",
+      ".claude/tools/aidlc-orchestrate.ts": "export {};",
+    };
+    const hashes = Object.fromEntries(
+      Object.entries(files).map(([path, content]) =>
+        [path, `sha256:${createHash("sha256").update(content).digest("hex")}`],
+      ),
+    );
+    await mkdir(join(worktree, ".claude/skills/aidlc"), { recursive: true });
+    await mkdir(join(worktree, ".claude/tools/data"), { recursive: true });
+    await mkdir(join(worktree, "aidlc"), { recursive: true });
+    await writeFile(join(worktree, "aidlc/record.md"), "Project record");
+    for (const [path, content] of Object.entries(files)) {
+      await writeFile(join(worktree, path), content);
+    }
+    await writeFile(join(worktree, ".claude/tools/data/aidlc-manifest.json"), JSON.stringify({
+      schemaVersion: 1,
+      distribution: "claude",
+      harnessDir: ".claude",
+      frameworkVersion: "2.11.4",
+      files: hashes,
+    }));
+    await gitOutput(worktree, ["add", ".claude", "aidlc"]);
+    await gitOutput(worktree, ["commit", "-m", "Install project harness"]);
+
+    expect((await syncHarness(root, "claude")).changed).toBe(false);
+    expect(await gitOutput(worktree, ["status", "--short"])).toBe("");
+    const verified = await verifyHarness(root, "claude", "api", "feature");
+    expect(verified.ok).toBe(true);
+    expect(verified.worktrees[0]?.manifestRevision).toBeTruthy();
+
+    await writeFile(join(worktree, ".claude/tools/aidlc.ts"), "Changed runtime");
+    await expect(syncHarness(root, "claude")).rejects.toThrow("project harness file hash mismatch");
+    expect((await verifyHarness(root, "claude")).ok).toBe(false);
+    expect(await readFile(join(worktree, ".claude/tools/aidlc.ts"), "utf8")).toBe("Changed runtime");
+    expect(await readFile(join(worktree, "aidlc/record.md"), "utf8")).toBe("Project record");
+  });
+
   test("refuses to overwrite project-owned tracked harness files", async () => {
     const fixture = await createFixture();
     await mkdir(join(fixture.worktree, ".claude"), { recursive: true });
@@ -171,7 +215,7 @@ describe("portfolio harness lifecycle", () => {
   });
 });
 
-async function createFixture(): Promise<{
+async function createFixture(harnessMode?: "project-managed"): Promise<{
   root: string;
   source: string;
   worktree: string;
@@ -209,6 +253,7 @@ async function createFixture(): Promise<{
     await writeYaml(root, "api.yaml", {
       schemaVersion: 1,
       id: "api",
+      ...(harnessMode ? { harnessMode } : {}),
       name: "API",
       repository: "repositories/api",
       description: "API project",
