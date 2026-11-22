@@ -306,12 +306,10 @@ Markdown. The operator runs this command from their own terminal, reviews
 the displayed Markdown, and types `approve`:
 
 ```bash
-bun "$SKILL_DIR/runtimes/<provider>/scripts/operator-answer.ts" \
+bun "$SKILL_DIR/scripts/operator-answer.ts" \
   --root <root> --id <packet-id> --file <answered.md> --mode chat
 ```
 
-Use `claude` or `codex` for `<provider>` in an override installation. For the
-original skill, the entry point is `$SKILL_DIR/scripts/operator-answer.ts`.
 The operator tool records the local OS account and resolves the packet.
 The supervisor and Runner must leave this command to the human operator.
 For external integrations that already issue approval records, use:
