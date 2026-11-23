@@ -582,6 +582,72 @@ describe("portfolio workspace", () => {
     })).rejects.toThrow("already answered");
   });
 
+  test("Codex user prompt approves only the staged review in the same thread", async () => {
+    const root = await temporaryRoot();
+    const id = "codex-chat";
+    const { answered } = await waitingQuestionPacket(root, id);
+    const script = new URL(
+      "../skills/aidlc-portfolio/scripts/codex-chat-approval.ts",
+      import.meta.url,
+    ).pathname;
+    const sessionId = "codex-test-thread";
+    const prepare = Bun.spawn(["bun", script, "prepare", "--id", id, "--file", answered], {
+      cwd: root,
+      env: { ...process.env, CODEX_THREAD_ID: sessionId },
+      stdout: "pipe",
+    });
+    expect(await prepare.exited).toBe(0);
+    const reviewed = await readFile(answered, "utf8");
+    expect(await new Response(prepare.stdout).json()).toEqual({ packet: id, content: reviewed });
+
+    async function sendPrompt(prompt: string, thread = sessionId): Promise<string> {
+      const hook = Bun.spawn(["bun", script], {
+        stdin: new Response(JSON.stringify({
+          hook_event_name: "UserPromptSubmit",
+          prompt,
+          session_id: thread,
+          cwd: root,
+        })),
+        stdout: "pipe",
+      });
+      expect(await hook.exited).toBe(0);
+      return new Response(hook.stdout).text();
+    }
+
+    expect(await sendPrompt("승인", "other-thread")).toBe("");
+    expect(await sendPrompt("승인하지 마")).toBe("");
+    await writeFile(answered, reviewed.trimEnd() + " (changed)\n");
+    expect(JSON.parse(await sendPrompt("승인"))).toMatchObject({
+      decision: "block",
+      reason: "answer file changed after operator review",
+    });
+    expect(await listQuestionPackets(root, "api", "feature", "pending")).toHaveLength(1);
+
+    await writeFile(answered, reviewed);
+    expect(await sendPrompt("승인")).toContain("Portfolio recorded human approval");
+    expect(await listQuestionPackets(root, "api", "feature", "answered")).toMatchObject([
+      { id, answerMode: "chat" },
+    ]);
+    expect(await sendPrompt("승인")).toBe("");
+  });
+
+  test("external chat approval resolves only the reviewed answers", async () => {
+    const root = await temporaryRoot();
+    const { answered } = await waitingQuestionPacket(root, "chat-review");
+    const reviewed = await readFile(answered, "utf8");
+    await recordHumanApproval(root, "bound", "chat-review", "Portfolio owner", reviewed);
+    await writeFile(answered, reviewed.trimEnd() + " (changed)\n");
+    await expect(
+      answerQuestionPacket(root, "chat-review", answered, "chat", "bound"),
+    ).rejects.toThrow("answer file changed after approval");
+    expect(await listQuestionPackets(root, "api", "feature", "pending")).toHaveLength(1);
+
+    await writeFile(answered, reviewed);
+    await expect(
+      answerQuestionPacket(root, "chat-review", answered, "chat", "bound"),
+    ).resolves.toMatchObject({ status: "active", answeredBy: "Portfolio owner" });
+  });
+
   test("refuses a consumed approval for a packet restored to pending", async () => {
     const root = await temporaryRoot();
     const { answered } = await waitingQuestionPacket(root, "restored");

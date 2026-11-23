@@ -153,6 +153,36 @@ cao install ./aidlc_runner.md
 Use `cao skills add ./skills/aidlc-portfolio --force` when intentionally
 updating an earlier installation.
 
+### Approve Portfolio answers in Codex chat
+
+In a local Codex client that supports command hooks, merge this entry into
+the Codex user-level `hooks.json` (normally `~/.codex/hooks.json`). Use the
+absolute Bun and script paths if your Codex process has a different `PATH`.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}/skills/aidlc-portfolio/scripts/codex-chat-approval.ts\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Enable or trust the hook in Codex and start the supervisor chat from the
+Portfolio root. After the supervisor shows the question packet and answered
+Markdown, reply `승인` in that chat. The hook processes only the review staged
+for that workspace and Codex session. It verifies the answer digest before
+resolving the packet and records the local operating system account.
+The local hook and workspace records share the local account's permissions.
+
 ### Migrate a legacy override installation
 
 Install or update the managed `aidlc-portfolio` skill with the commands above.
