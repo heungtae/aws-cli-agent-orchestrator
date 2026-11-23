@@ -301,17 +301,29 @@ bun "$SKILL_DIR/scripts/portfolio.ts" question submit \
 Submission rejects any pre-filled answer and moves the session to `waiting`.
 The runner reports the packet and stops. It must never invoke `question answer`.
 
-Give the operator the packet ID and the absolute path to the answered
-Markdown. The operator runs this command from their own terminal, reviews
-the displayed Markdown, and types `approve`:
+When the Codex `UserPromptSubmit` hook is configured, prepare the approval
+from the Portfolio root in the same supervisor chat:
+
+```bash
+bun "$SKILL_DIR/scripts/codex-chat-approval.ts" prepare \
+  --id <packet-id> --file <answered.md> --mode guided|markdown|chat
+```
+
+Pass one interaction mode. Show the operator the packet ID and the exact
+Markdown returned by the command, then ask them to reply `승인` in that chat.
+The hook records approval and resolves the packet. Check the packet status
+before resuming the Runner. Leave confirmation to the operator and never
+invoke the hook or generate the approval reply on their behalf.
+
+Without a configured chat hook, give the operator the packet ID and the
+absolute path to the answered Markdown. They can review it and type `approve`
+using the local terminal fallback:
 
 ```bash
 bun "$SKILL_DIR/scripts/operator-answer.ts" \
   --root <root> --id <packet-id> --file <answered.md> --mode chat
 ```
 
-The operator tool records the local OS account and resolves the packet.
-The supervisor and Runner must leave this command to the human operator.
 For external integrations that already issue approval records, use:
 
 ```bash
@@ -323,9 +335,11 @@ bun "$SKILL_DIR/scripts/portfolio.ts" question answer \
 The command refuses a packet that is no longer `pending` before it reads any
 approval, so a replay of an answered packet stops at that status gate. It also
 rejects changed question text, missing answers, invalid modes, a missing or
-malformed approval, and an approval bound to a different packet. An approval
-already consumed is refused as well, as defense in depth for a packet restored
-to `pending`. It preserves the answered Markdown byte-for-byte, binds the resolution
+malformed approval, and an approval bound to a different packet. When an
+external approval provides the reviewed answer digest, the command checks it
+against the submitted Markdown. A consumed approval remains unusable if the
+packet is restored to `pending`. The command preserves the answered Markdown
+byte-for-byte, binds the resolution
 to the human-surface approval (the answerer identity comes from that record,
 not from a caller-supplied name), and returns the session to `active`. Use
 `question list` to verify status before asking the runner to resume.

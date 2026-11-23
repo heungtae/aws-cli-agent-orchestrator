@@ -62,20 +62,20 @@ Generated AI-DLC questions are immutable, human-owned decision points.
    packets are rejected and the session becomes `waiting`.
 2. The supervisor offers Guide, Edit Markdown, or Chat.
 3. The supervisor writes human answers verbatim without changing question text.
-4. The human reviews and confirms the Markdown in their own terminal with
-   `operator-answer.ts`, which records the local OS account and resolves the
-   packet. An external human-approval surface may also issue a record for use
-   with `question answer`. A chat reply by itself does not issue a record.
-   The supervisor and runner must leave confirmation to the human operator.
-5. Both resolution paths validate question integrity and require every answer.
-   The external path requires a matching, unconsumed approval ID. The
-   terminal path binds the approved content to the local operator account.
-   An answered packet cannot be resolved again.
+4. The human reviews the exact Markdown and replies `승인` when the Codex
+   chat hook is configured. The hook resolves the review prepared for that
+   Codex session. The operator can also use the interactive terminal
+   fallback or a configured external human-approval surface.
+5. Every resolution path validates question integrity and requires all answers.
+   The Codex hook and terminal path bind the reviewed content to the local
+   operator account. External approvals require a matching, unconsumed approval
+   ID. The resolver checks the reviewed answer digest when the record provides
+   one. Each packet can be resolved once.
 6. The runner resumes only after observing the answered packet.
 
-The sample stores approval records in `portfolio/approvals/`. The interactive
-prompt is an operator workflow. A process running under the same OS account
-can start a pseudo-terminal or write to the workspace. Deployments that need
+The sample stores approval records in `portfolio/approvals/`. A process running
+under the same OS account can invoke local programs or write to the workspace.
+Deployments that need
 to enforce a separate human trust boundary require a protected approval
 service or records signed with a key outside the agent's reach.
 

@@ -113,16 +113,13 @@ Never infer acceptance from silence.
 When a runner submits a question packet, offer exactly three interaction modes:
 Guide, Edit Markdown, or Chat. In every mode, preserve the generated question
 text and write the user's answer verbatim after its `[Answer]:` marker. The
-human then actions CAO's human-approval surface, which mints an approval record
-carrying their verified identity. Resolve the packet with
-`question answer --approval-id <id>`: the answerer identity is taken from that
-approval record, never from an argument you supply, and a packet with no
-matching human-surface approval is refused. Do not synthesize an answer, select
-a default, or treat tool-permission bypass as decision authority. In this
-sample the approval record is a plain file in the agent's own worktree, so
-this is defense-in-depth, not a structural boundary: real enforcement needs
-the record kept outside the agent's write reach or signed with a key the
-agent does not hold.
+human then confirms the reviewed content. When the Codex chat hook is configured,
+prepare the approval as described in the skill, show the returned Markdown, and
+request a reply of `승인` in the same chat. Check that the hook resolved the
+packet before resuming the Runner. For an external approval surface, use
+`question answer --approval-id <id>` with its approval record. If neither is
+available, give the human the interactive terminal fallback. Preserve their
+answers verbatim and leave the approval decision to them.
 
 Do not require the operator to do anything beyond creating and entering the
 portfolio root. The supervisor initializes its contents, clones repositories,

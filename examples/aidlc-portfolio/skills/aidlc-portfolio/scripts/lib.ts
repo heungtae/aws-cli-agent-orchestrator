@@ -192,6 +192,7 @@ interface HumanApprovalRecord {
   answeredBy: string;
   source: ApprovalSource;
   recordedAt: string;
+  answerRevision?: string;
   consumed?: boolean;
   consumedAt?: string;
 }
@@ -894,7 +895,72 @@ export async function approveQuestionFromOperator(
   operator: { name: string; reviewedContent: string },
 ): Promise<{ path: string; status: "active"; answeredBy: string; approvalId: string }> {
   if (!operator.name.trim()) throw new PortfolioError("operator identity is empty");
-  return resolveQuestionPacket(root, id, sourceFile, mode, { operator });
+  return resolveQuestionPacket(root, id, sourceFile, mode, {
+    operator: { name: operator.name, answerRevision: contentRevision(operator.reviewedContent) },
+  });
+}
+
+interface ChatApprovalDraft {
+  id: string;
+  file: string;
+  mode: QuestionAnswerMode;
+  answerRevision: string;
+}
+
+function chatApprovalPath(root: string, sessionId: string): string {
+  assertId(sessionId, "chat session id");
+  return join(workspacePaths(root).portfolio, "chat-approvals", `${sessionId}.json`);
+}
+
+export async function prepareChatApproval(
+  root: string,
+  sessionId: string,
+  id: string,
+  file: string,
+  mode: QuestionAnswerMode,
+): Promise<string> {
+  assertId(id, "question packet id");
+  const source = resolve(file);
+  return withLock(root, async () => {
+    const packet = await readQuestionPacket(root, id);
+    const content = await readFile(source, "utf8");
+    validatePendingAnswer(packet, content);
+    const path = chatApprovalPath(root, sessionId);
+    if (await pathExists(path)) {
+      const previous = await readJson<ChatApprovalDraft>(path);
+      if (previous.id !== id && (await readQuestionPacket(root, previous.id)).status === "pending") {
+        throw new PortfolioError(`chat session already has a review for packet ${previous.id}`);
+      }
+    }
+    const draft: ChatApprovalDraft = { id, file: source, mode, answerRevision: contentRevision(content) };
+    await atomicWrite(path, JSON.stringify(draft));
+    return content;
+  });
+}
+
+export async function approveFromChat(root: string, sessionId: string, name: string) {
+  const path = chatApprovalPath(root, sessionId);
+  if (!(await pathExists(path))) return null;
+  const draft = await readJson<ChatApprovalDraft>(path);
+  return resolveQuestionPacket(root, draft.id, draft.file, draft.mode, {
+    operator: { name, answerRevision: draft.answerRevision, chatSession: sessionId },
+  });
+}
+
+function validatePendingAnswer(packet: QuestionPacket, content: string): void {
+  if (packet.status !== "pending") {
+    throw new PortfolioError(`question packet ${packet.id} is already ${packet.status}`);
+  }
+  const parsed = parseQuestionDocument(content);
+  if (
+    parsed.answers.length !== packet.questionCount ||
+    contentRevision(parsed.skeleton) !== packet.questionRevision
+  ) {
+    throw new PortfolioError("answered question packet changed generated question text or structure");
+  }
+  if (parsed.answers.some((answer) => answer.trim().length === 0)) {
+    throw new PortfolioError("every generated question requires a human answer");
+  }
 }
 
 async function resolveQuestionPacket(
@@ -902,7 +968,7 @@ async function resolveQuestionPacket(
   id: string,
   sourceFile: string,
   mode: QuestionAnswerMode,
-  authority: { approvalId: string } | { operator: { name: string; reviewedContent: string } },
+  authority: { approvalId: string } | { operator: { name: string; answerRevision: string; chatSession?: string } },
 ): Promise<{ path: string; status: "active"; answeredBy: string; approvalId: string }> {
   assertId(id, "question packet id");
   if (!["guided", "markdown", "chat"].includes(mode)) {
@@ -910,27 +976,23 @@ async function resolveQuestionPacket(
   }
   const root = resolve(rootInput);
   const content = await readFile(resolve(sourceFile), "utf8");
-  if ("operator" in authority && content !== authority.operator.reviewedContent) {
+  const answerRevision = contentRevision(content);
+  if ("operator" in authority && answerRevision !== authority.operator.answerRevision) {
     throw new PortfolioError("answer file changed after operator review");
   }
-  const parsed = parseQuestionDocument(content);
 
   return withLock(root, async () => {
+    let chatDraftPath: string | undefined;
+    if ("operator" in authority && authority.operator.chatSession) {
+      chatDraftPath = chatApprovalPath(root, authority.operator.chatSession);
+      const draft = await readJson<ChatApprovalDraft>(chatDraftPath);
+      if (draft.id !== id || draft.file !== resolve(sourceFile) ||
+          draft.mode !== mode || draft.answerRevision !== answerRevision) {
+        throw new PortfolioError("chat approval draft changed during confirmation");
+      }
+    }
     const packet = await readQuestionPacket(root, id);
-    if (packet.status !== "pending") {
-      throw new PortfolioError(`question packet ${id} is already ${packet.status}`);
-    }
-    if (
-      parsed.answers.length !== packet.questionCount ||
-      contentRevision(parsed.skeleton) !== packet.questionRevision
-    ) {
-      throw new PortfolioError(
-        "answered question packet changed generated question text or structure",
-      );
-    }
-    if (parsed.answers.some((answer) => answer.trim().length === 0)) {
-      throw new PortfolioError("every generated question requires a human answer");
-    }
+    validatePendingAnswer(packet, content);
 
     const approval: HumanApprovalRecord = "approvalId" in authority
       ? await readHumanApproval(root, authority.approvalId)
@@ -941,6 +1003,7 @@ async function resolveQuestionPacket(
           answeredBy: authority.operator.name,
           source: "human-surface",
           recordedAt: new Date().toISOString(),
+          answerRevision,
         };
     const approvalId = approval.id;
     if (approval.source !== "human-surface") {
@@ -955,6 +1018,9 @@ async function resolveQuestionPacket(
     }
     if (approval.consumed) {
       throw new PortfolioError(`approval ${approvalId} has already been used`);
+    }
+    if (approval.answerRevision !== undefined && approval.answerRevision !== answerRevision) {
+      throw new PortfolioError(`answer file changed after approval ${approvalId}`);
     }
     const answeredBy = approval.answeredBy.trim();
     if (!answeredBy) {
@@ -985,6 +1051,7 @@ async function resolveQuestionPacket(
       `${JSON.stringify({ ...approval, consumed: true, consumedAt: now }, null, 2)}\n`,
     );
     await setSessionStatus(loaded, packet.intent, packet.project, "active");
+    if (chatDraftPath) await rm(chatDraftPath, { force: true });
     return { path: questionDocumentPath(root, id), status: "active", answeredBy, approvalId };
   });
 }
@@ -1001,6 +1068,7 @@ export async function recordHumanApproval(
   approvalId: string,
   packetId: string,
   answeredBy: string,
+  reviewedContent?: string,
 ): Promise<{ id: string; packet: string; answeredBy: string }> {
   assertId(approvalId, "approval id");
   assertId(packetId, "question packet id");
@@ -1022,6 +1090,7 @@ export async function recordHumanApproval(
       answeredBy: answeredBy.trim(),
       source: "human-surface",
       recordedAt: new Date().toISOString(),
+      answerRevision: reviewedContent === undefined ? undefined : contentRevision(reviewedContent),
     };
     await atomicWrite(path, `${JSON.stringify(record, null, 2)}\n`);
     return { id: approvalId, packet: packetId, answeredBy: record.answeredBy };
@@ -1062,6 +1131,10 @@ function approvalShapeProblems(record: unknown, approvalId: string): string[] {
   }
   if (typeof record.id === "string" && record.id !== approvalId) {
     problems.push(`id ${record.id} does not match ${approvalId}`);
+  }
+  if (record.answerRevision !== undefined &&
+      (typeof record.answerRevision !== "string" || !/^[0-9a-f]{64}$/.test(record.answerRevision))) {
+    problems.push("answerRevision must be a lowercase SHA-256 digest");
   }
   if (record.consumed !== undefined && typeof record.consumed !== "boolean") {
     problems.push("consumed must be a boolean");
