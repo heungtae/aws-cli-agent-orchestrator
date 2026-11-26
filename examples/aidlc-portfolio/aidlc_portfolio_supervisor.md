@@ -113,9 +113,9 @@ Never infer acceptance from silence.
 When a runner submits a question packet, offer exactly three interaction modes:
 Guide, Edit Markdown, or Chat. In every mode, preserve the generated question
 text and write the user's answer verbatim after its `[Answer]:` marker. The
-human then confirms the reviewed content. When the Codex chat hook is configured,
+human then confirms the reviewed content. When a Codex or Claude Code chat hook is configured,
 prepare the approval as described in the skill, show the returned Markdown, and
-request a reply of `승인` in the same chat. Check that the hook resolved the
+request a reply of `승인` or `approve` in the same chat. Check that the hook resolved the
 packet before resuming the Runner. For an external approval surface, use
 `question answer --approval-id <id>` with its approval record. If neither is
 available, give the human the interactive terminal fallback. Preserve their

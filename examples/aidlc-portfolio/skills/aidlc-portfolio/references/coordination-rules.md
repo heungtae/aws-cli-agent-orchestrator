@@ -62,12 +62,12 @@ Generated AI-DLC questions are immutable, human-owned decision points.
    packets are rejected and the session becomes `waiting`.
 2. The supervisor offers Guide, Edit Markdown, or Chat.
 3. The supervisor writes human answers verbatim without changing question text.
-4. The human reviews the exact Markdown and replies `승인` when the Codex
-   chat hook is configured. The hook resolves the review prepared for that
-   Codex session. The operator can also use the interactive terminal
+4. The human reviews the exact Markdown and replies `승인` or `approve` when a
+   Codex or Claude Code chat hook is configured. The hook resolves the review prepared for that
+   chat session. The operator can also use the interactive terminal
    fallback or a configured external human-approval surface.
 5. Every resolution path validates question integrity and requires all answers.
-   The Codex hook and terminal path bind the reviewed content to the local
+   The chat hooks and terminal path bind the reviewed content to the local
    operator account. External approvals require a matching, unconsumed approval
    ID. The resolver checks the reviewed answer digest when the record provides
    one. Each packet can be resolved once.

@@ -582,16 +582,33 @@ describe("portfolio workspace", () => {
     })).rejects.toThrow("already answered");
   });
 
-  test("Codex user prompt approves only the staged review in the same thread", async () => {
+  test.each([
+    ["codex", "승인"],
+    ["codex", "approve"],
+    ["claude", "승인"],
+    ["claude", "approve"],
+  ])("%s accepts %s only for the reviewed answer in the same session", async (client, approval) => {
     const root = await temporaryRoot();
-    const id = "codex-chat";
+    const id = "chat-review";
     const { answered } = await waitingQuestionPacket(root, id);
     const script = new URL(
-      "../skills/aidlc-portfolio/scripts/codex-chat-approval.ts",
+      `../skills/aidlc-portfolio/scripts/${client}-chat-approval.ts`,
       import.meta.url,
     ).pathname;
-    const sessionId = "codex-test-thread";
-    const prepare = Bun.spawn(["bun", script, "prepare", "--id", id, "--file", answered], {
+    const sessionId = "test-thread";
+    const envFile = join(root, "claude.env");
+    let prepareCommand = ["bun", script];
+    if (client === "claude") {
+      const start = Bun.spawn(["bun", script], {
+        env: { ...process.env, CLAUDE_ENV_FILE: envFile },
+        stdin: new Response(JSON.stringify({ hook_event_name: "SessionStart", session_id: sessionId })),
+        stdout: "pipe",
+      });
+      expect(await start.exited).toBe(0);
+      expect(await new Response(start.stdout).text()).toBe("");
+      prepareCommand = ["bash", "-c", 'source "$1"; shift; exec "$@"', "prepare", envFile, "bun", script];
+    }
+    const prepare = Bun.spawn([...prepareCommand, "prepare", "--id", id, "--file", answered], {
       cwd: root,
       env: { ...process.env, CODEX_THREAD_ID: sessionId },
       stdout: "pipe",
@@ -614,21 +631,22 @@ describe("portfolio workspace", () => {
       return new Response(hook.stdout).text();
     }
 
-    expect(await sendPrompt("승인", "other-thread")).toBe("");
+    expect(await sendPrompt(approval, "other-thread")).toBe("");
     expect(await sendPrompt("승인하지 마")).toBe("");
+    expect(await sendPrompt("approve this")).toBe("");
     await writeFile(answered, reviewed.trimEnd() + " (changed)\n");
-    expect(JSON.parse(await sendPrompt("승인"))).toMatchObject({
+    expect(JSON.parse(await sendPrompt(approval))).toMatchObject({
       decision: "block",
       reason: "answer file changed after operator review",
     });
     expect(await listQuestionPackets(root, "api", "feature", "pending")).toHaveLength(1);
 
     await writeFile(answered, reviewed);
-    expect(await sendPrompt("승인")).toContain("Portfolio recorded human approval");
+    expect(await sendPrompt(approval)).toContain("Portfolio recorded human approval");
     expect(await listQuestionPackets(root, "api", "feature", "answered")).toMatchObject([
       { id, answerMode: "chat" },
     ]);
-    expect(await sendPrompt("승인")).toBe("");
+    expect(await sendPrompt(approval)).toBe("");
   });
 
   test("external chat approval resolves only the reviewed answers", async () => {

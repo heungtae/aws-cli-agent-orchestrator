@@ -178,10 +178,49 @@ absolute Bun and script paths if your Codex process has a different `PATH`.
 
 Enable or trust the hook in Codex and start the supervisor chat from the
 Portfolio root. After the supervisor shows the question packet and answered
-Markdown, reply `승인` in that chat. The hook processes only the review staged
+Markdown, reply `승인` or `approve` in that chat. The hook processes only the review staged
 for that workspace and Codex session. It verifies the answer digest before
 resolving the packet and records the local operating system account.
 The local hook and workspace records share the local account's permissions.
+
+### Approve Portfolio answers in Claude Code chat
+
+Merge both hooks into Claude Code's user settings (normally
+`~/.claude/settings.json`). The [Claude Code hooks reference](https://code.claude.com/docs/en/hooks)
+describes these events and how `CLAUDE_ENV_FILE` passes the session ID to
+subsequent Bash commands.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}/skills/aidlc-portfolio/scripts/claude-chat-approval.ts\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}/skills/aidlc-portfolio/scripts/claude-chat-approval.ts\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Start or resume Claude Code from the Portfolio root after configuring both
+hooks. Prepare the review with `claude-chat-approval.ts prepare` in that
+supervisor session. After reviewing the Markdown, reply `승인` or `approve`
+in the same session.
 
 ### Migrate a legacy override installation
 

@@ -301,16 +301,20 @@ bun "$SKILL_DIR/scripts/portfolio.ts" question submit \
 Submission rejects any pre-filled answer and moves the session to `waiting`.
 The runner reports the packet and stops. It must never invoke `question answer`.
 
-When the Codex `UserPromptSubmit` hook is configured, prepare the approval
-from the Portfolio root in the same supervisor chat:
+When a chat approval hook is configured, prepare the approval from the
+Portfolio root in the same supervisor chat. Use the script for your chat client:
 
 ```bash
 bun "$SKILL_DIR/scripts/codex-chat-approval.ts" prepare \
   --id <packet-id> --file <answered.md> --mode guided|markdown|chat
+
+# Claude Code
+bun "$SKILL_DIR/scripts/claude-chat-approval.ts" prepare \
+  --id <packet-id> --file <answered.md> --mode guided|markdown|chat
 ```
 
 Pass one interaction mode. Show the operator the packet ID and the exact
-Markdown returned by the command, then ask them to reply `승인` in that chat.
+Markdown returned by the command, then ask them to reply `승인` or `approve` in that chat.
 The hook records approval and resolves the packet. Check the packet status
 before resuming the Runner. Leave confirmation to the operator and never
 invoke the hook or generate the approval reply on their behalf.
