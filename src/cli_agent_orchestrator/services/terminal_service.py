@@ -31,12 +31,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from pydantic import ValidationError
 
-from cli_agent_orchestrator.backends.base import TerminalCleanupOutcome
+from cli_agent_orchestrator.backends.base import (
+    InputNotSentError,
+    TerminalCleanupOutcome,
+    TerminalNotFoundError,
+)
 from cli_agent_orchestrator.backends.registry import get_backend
 
 # Compatibility/test seam: creation no longer bulk-deletes with this helper, but older
@@ -66,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     get_kept_terminal,
     get_session_incarnation,
     get_terminal_metadata,
+    list_all_terminals,
     list_pending_deferred_init_external_owner_terminal_ids,
     list_pending_initial_delivery_terminal_ids,
     list_siblings_by_group_prefix,
@@ -95,7 +100,7 @@ from cli_agent_orchestrator.constants import (
     TURN_START_CONFIRM_SECONDS,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
-from cli_agent_orchestrator.models.delegation import EdgeState
+from cli_agent_orchestrator.models.delegation import DelegationEdge, EdgeState
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.kiro_engine import (
     KiroEngine,
@@ -1171,13 +1176,33 @@ def _roll_back_cancelled_create(
     between the worker's commit and this compensation, and killing by name
     then would destroy the replacement and clear its forwarded env. Under the
     lock, kill the session/window only if this call's row still belongs to the
-    current incarnation. Always drop this terminal's own row: no provider or
-    deferred-init task has been started yet, so retaining the pending row would
-    leave an UNKNOWN terminal that nobody can finish initializing.
+    current incarnation.
+
+    The worker also registered this terminal's FIFO reader and provider before
+    it returned (#1458 moved that registration inside the locked section), so
+    those are undone too, in ``_roll_back_failed_create``'s order: reader and
+    status buffer first, then the backend, then the provider. The row is then
+    dropped, because no deferred-init task has been started and a retained
+    pending row would be an UNKNOWN terminal nobody can finish initializing,
+    UNLESS a cleanup is incomplete: the provider deferred it, or ``stop_reader``
+    returned ``False`` (its reader thread is still alive or its FIFO is still on
+    disk, and fifo_manager keeps it tracked for a retry). Then the row is the
+    only retry handle and is kept, as ``dismantle_terminal_runtime`` keeps it.
+    For both, only an explicit ``False`` counts: a raised error does not keep
+    the row (the provider's error is logged; the reader's is ignored).
 
     Best-effort like its sibling: the cancellation is already propagating and
     is what the caller must see.
     """
+    reader_complete = True
+    try:
+        reader_complete = fifo_manager.stop_reader(terminal_id) is not False
+    except Exception:
+        pass  # Ignore cleanup errors
+    try:
+        status_monitor.clear_terminal(terminal_id)
+    except Exception:
+        pass  # Ignore cleanup errors
     with session_lifecycle_lock(session_name):
         if _still_owns_incarnation(session_name, terminal_id):
             _roll_back_backend_create_locked(
@@ -1186,6 +1211,26 @@ def _roll_back_cancelled_create(
                 created_session=created_session,
                 terminal_id=terminal_id,
             )
+        # Under the lock, as ``delete_session`` releases a provider: only this
+        # call's own registration is touched, keyed by its terminal id.
+        try:
+            cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+        except Exception:
+            cleanup_complete = True
+        if not cleanup_complete:
+            logger.warning(
+                "Cancelled-create rollback deferred provider cleanup for %s; "
+                "retaining terminal metadata for retry",
+                terminal_id,
+            )
+            return
+        if not reader_complete:
+            logger.warning(
+                "Cancelled-create rollback could not stop the FIFO reader for %s; "
+                "retaining terminal metadata for retry",
+                terminal_id,
+            )
+            return
         try:
             db_delete_terminal(terminal_id, end_reason="launch_failed")
         except Exception:
@@ -1203,7 +1248,7 @@ def _roll_back_backend_create_if_still_ours(
 ) -> None:
     """Undo a create that failed AFTER the locked transaction committed.
 
-    Provider initialisation, FIFO setup and the rest of ``create_terminal`` run
+    Provider initialisation and the rest of ``create_terminal`` run
     after the lifecycle lock was released, so by the time their failure reaches
     the outer handler another caller may have torn the name down and rebuilt it
     (``delete_session`` then a fresh ``new_session=True`` create, or the reverse
@@ -1968,6 +2013,19 @@ def _keep_kiro_home_out_of_session(session_name: str, kiro_launch: Optional[Kiro
         get_backend().restore_session_env(
             session_name, kiro_launch_home.KIRO_HOME_ENV, str(kiro_launch.home.home)
         )
+
+
+def _role_labels(agent_profile: str, caller_id: Optional[str]) -> dict[str, str]:
+    """Labels written with a terminal: its profile and, for a worker, its caller.
+
+    An empty profile or caller adds no key, so a label never carries an empty value.
+    """
+    labels: dict[str, str] = {}
+    if agent_profile:
+        labels["cao.profile"] = agent_profile
+    if caller_id:
+        labels["cao.caller"] = caller_id
+    return labels
 
 
 async def create_terminal(
@@ -2841,6 +2899,7 @@ async def _create_terminal_unguarded(
             and "*" not in allowed_tools
         ):
             from cli_agent_orchestrator.utils.tool_mapping import (
+                CAO_CALLBACK_REFS,
                 kiro_agent_tools,
                 kiro_universal_tools,
             )
@@ -2872,7 +2931,13 @@ async def _create_terminal_unguarded(
                     if installed_kiro_agent_is_universal(agent_profile)
                     else kiro_agent_tools(allowed_tools)
                 )
-                wider = [tool for tool in installed if tool not in permitted]
+                # The callback references a Kiro install adds are not wider: the
+                # tool gate allows those tools to every bound terminal.
+                wider = [
+                    tool
+                    for tool in installed
+                    if tool not in permitted and tool not in CAO_CALLBACK_REFS
+                ]
                 if wider:
                     raise InstalledPolicyExceedsAllowlistError(
                         f"Delegation refused: the installed Kiro agent '{agent_profile}' "
@@ -3143,6 +3208,38 @@ async def _create_terminal_unguarded(
                 f"unrestricted until `cao install {agent_profile} --provider kiro_cli` is re-run."
             )
 
+        # Step 6 inputs: the provider is created and registered inside the
+        # critical section below (#1458) and initialized after it.
+        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
+        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
+        # the skill catalog here; Kiro (skill:// resources) and OpenCode
+        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
+        # Copilot gets the catalog baked at install time.
+        #
+        # Issue #1082 (provisional): a fresh (non-resume) Claude Code launch
+        # gets a CAO-generated session id, stored on the launch record so a
+        # later usage adapter can join provider-native session logs to this
+        # terminal without CAO reading any transcript itself. Only Claude Code
+        # exposes a caller-chosen session id today; every other provider's
+        # stored id stays None.
+        fresh_claude_session_id: Optional[str] = (
+            str(uuid.uuid4())
+            if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
+            else None
+        )
+        # Only a Kiro helper passes its launch, and only a Claude Code helper the
+        # ephemeral flag, so every other call is unchanged. The flag is the bind
+        # above, the fact that marks this terminal ephemeral, never the profile
+        # text, and it keys on the provider that actually runs.
+        provider_launch_options: dict[str, Any] = (
+            {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
+        )
+        if (
+            provider == ProviderType.CLAUDE_CODE.value
+            and ephemeral_state.bound_terminal_id == terminal_id
+        ):
+            provider_launch_options["ephemeral"] = True
+
         # Step 3c: Create the tmux session/window and its registry row as ONE
         # atomic step, under the per-session-name lifecycle lock (#498). This
         # merges what used to be two separate steps -- the tmux create and the
@@ -3174,8 +3271,15 @@ async def _create_terminal_unguarded(
         # Why the section ends here: provider.initialize() below can take tens
         # of seconds, and a teardown of this name must never queue behind an
         # agent launch. Everything inside is short, synchronous state mutation.
+
+        # Set by the critical section: the registered provider, or the error a
+        # registration step raised (re-raised below so the ordinary rollback runs).
+        registered_provider: Any = None
+        registration_error: Optional[Exception] = None
         deferred_delete_on_failure: bool | None = None
         session_incarnation_id: str | None = None
+
+        role_labels = _role_labels(agent_profile, caller_id)
 
         def _create_session_or_window_locked() -> Tuple[str, bool, bool]:
             """Runs under the lifecycle lock on a worker thread.
@@ -3220,6 +3324,7 @@ async def _create_terminal_unguarded(
             name goes free -> free with no observable intermediate state.
             """
             nonlocal deferred_delete_on_failure, session_incarnation_id, created_terminal_facts
+            nonlocal registered_provider, registration_error
             assert session_name is not None  # narrowed by the caller
             with session_lifecycle_lock(session_name):
                 if new_session:
@@ -3246,6 +3351,7 @@ async def _create_terminal_unguarded(
                         terminal_id,
                         resolved_working_directory,
                         extra_env=effective_env or None,
+                        extra_labels=role_labels,
                     )
                     created_window_name = window_name
                     created_session, created_window = True, False
@@ -3278,6 +3384,7 @@ async def _create_terminal_unguarded(
                         terminal_id,
                         resolved_working_directory,
                         extra_env=effective_env,
+                        extra_labels=role_labels,
                     )
                     created_session, created_window = False, True
 
@@ -3379,6 +3486,59 @@ async def _create_terminal_unguarded(
                         created_session=created_session,
                     )
                     raise
+                # Steps 4/5/6: register the FIFO reader and the provider while
+                # STILL holding the lock that made the row visible (#1458). They
+                # used to run after the lock was released, so a same-name
+                # ``delete_session`` that had been waiting on it could run in the
+                # gap: it saw the new row, stopped a reader and cleaned up a
+                # provider that did not exist yet, and returned, after which the
+                # create registered both for a row that was gone. Held across,
+                # the teardown waits for the registrations and then dismantles
+                # them. Only registration is under the lock (reader thread
+                # start, pipe-pane attach, one key, a provider constructor);
+                # ``provider.initialize()``, which can take tens of seconds, runs
+                # after release, so a teardown never queues behind an agent
+                # launch.
+                try:
+                    # Step 4/5: Set up the FIFO event-driven output pipeline for
+                    # pipe-pane backends (tmux). Event-inbox backends (herdr)
+                    # deliver via their own socket events and their pipe_pane is
+                    # a no-op, so skip the FIFO there and rely on the herdr inbox
+                    # registration below.
+                    if not get_backend().supports_event_inbox():
+                        # Reader first, then pipe-pane, with the liveness watchdog
+                        # (#388). The helper stops the reader again if pipe-pane
+                        # raises, and the error then reaches the handler below.
+                        attach_output_pipeline(terminal_id, session_name, created_window_name)
+
+                        # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
+                        # pipe-pane only captures output produced after it starts; on a fast
+                        # shell the initial prompt is drawn before the pipe attaches, leaving
+                        # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
+                        # Enter produces a fresh prompt line that flows through the pipe.
+                        get_backend().send_special_key(session_name, created_window_name, "Enter")
+
+                    registered_provider = provider_manager.create_provider(
+                        provider,
+                        terminal_id,
+                        session_name,
+                        created_window_name,
+                        agent_profile,
+                        allowed_tools,
+                        skill_prompt=skill_prompt,
+                        model=launch_model,
+                        effort=launch_effort,
+                        engine=resolved_engine,
+                        resume_session_id=resume_session_id,
+                        session_id=fresh_claude_session_id,
+                        **provider_launch_options,
+                    )
+                except Exception as exc:
+                    # Hand the failure out with the created-flags, so the caller
+                    # re-raises it into the same rollback
+                    # (``_roll_back_failed_create``) that handled a registration
+                    # failure before this step moved under the lock.
+                    registration_error = exc
                 return created_window_name, created_session, created_window
 
         # The worker is UN-CANCELLABLE once dispatched: cancelling this await
@@ -3396,6 +3556,8 @@ async def _create_terminal_unguarded(
         try:
             window_name, session_created, window_created = await asyncio.shield(create_worker)
             rollback_window_name = window_name
+            if registration_error is not None:
+                raise registration_error
         except asyncio.CancelledError:
             if not create_worker.cancelled():
                 compensator = asyncio.ensure_future(
@@ -3412,91 +3574,15 @@ async def _create_terminal_unguarded(
             _clear_identity_check_in_flight(terminal_id)
             raise
 
-        # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
-        # backends (tmux). Event-inbox backends (herdr) deliver via their own
-        # socket events and their pipe_pane is a no-op, so skip the FIFO there and
-        # rely on the herdr inbox registration below.
-        if not get_backend().supports_event_inbox():
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+        # Steps 4/5/6 (the FIFO reader, pipe-pane and the provider registration)
+        # already ran under the lifecycle lock, inside the critical section above
+        # (#1458). Only ``provider.initialize()`` is left outside it.
+        provider_instance = registered_provider
 
-            # Reader must exist BEFORE pipe-pane starts so it captures from the
-            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
-            # supply a probe for tmux's live pane content and a re-arm that
-            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
-            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
-            # so the backend's ``pipe-pane -o`` toggle would just switch the
-            # dead pipe OFF instead of restarting it.
-            def _probe_pane(s=session_name, w=window_name) -> str:
-                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
-
-            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
-                get_backend().stop_pipe_pane(s, w)
-                get_backend().pipe_pane(s, w, p)
-
-            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
-
-            # Configure pipe-pane to stream output to the FIFO. This enables
-            # real-time event-driven processing via StatusMonitor and LogWriter
-            # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
-            # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            get_backend().pipe_pane(session_name, window_name, str(fifo_path))
-
-            # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
-            # pipe-pane only captures output produced after it starts; on a fast
-            # shell the initial prompt is drawn before the pipe attaches, leaving
-            # the StatusMonitor buffer empty so wait_for_shell() times out. A bare
-            # Enter produces a fresh prompt line that flows through the pipe.
-            get_backend().send_special_key(session_name, window_name, "Enter")
-
-        # Step 6: Create and initialize the CLI provider
-        # This starts the agent (e.g., runs "kiro-cli chat --agent developer").
-        # Only runtime-prompt providers (Claude Code, Codex, Kimi) receive
-        # the skill catalog here; Kiro (skill:// resources) and OpenCode
-        # (OPENCODE_CONFIG_DIR/skills symlink) discover skills natively;
-        # Copilot gets the catalog baked at install time.
-        #
-        # Issue #1082 (provisional): a fresh (non-resume) Claude Code launch
-        # gets a CAO-generated session id, stored on the launch record so a
-        # later usage adapter can join provider-native session logs to this
-        # terminal without CAO reading any transcript itself. Only Claude Code
-        # exposes a caller-chosen session id today; every other provider's
-        # stored id stays None.
-        fresh_claude_session_id: Optional[str] = (
-            str(uuid.uuid4())
-            if provider == ProviderType.CLAUDE_CODE.value and not resume_session_id
-            else None
-        )
-        # Only a Kiro helper passes its launch, and only a Claude Code helper the
-        # ephemeral flag, so every other call is unchanged. The flag is the bind
-        # above, the fact that marks this terminal ephemeral, never the profile
-        # text, and it keys on the provider that actually runs.
-        provider_launch_options: dict[str, Any] = (
-            {"kiro_launch": kiro_launch} if kiro_launch is not None else {}
-        )
-        if (
-            provider == ProviderType.CLAUDE_CODE.value
-            and ephemeral_state.bound_terminal_id == terminal_id
-        ):
-            provider_launch_options["ephemeral"] = True
-        provider_instance = provider_manager.create_provider(
-            provider,
-            terminal_id,
-            session_name,
-            window_name,
-            agent_profile,
-            allowed_tools,
-            skill_prompt=skill_prompt,
-            model=launch_model,
-            effort=launch_effort,
-            engine=resolved_engine,
-            resume_session_id=resume_session_id,
-            session_id=fresh_claude_session_id,
-            **provider_launch_options,
-        )
         # Interactive prompt-capable providers have no CAO first message, so
-        # inject memory through their launch prompt. Resolve after provider
-        # registration: context lookup can involve a remote owner and must not
-        # widen the row-visible/runtime-missing teardown race. Initialization
+        # inject memory through their launch prompt. Resolve after the locked
+        # section: context lookup can involve a remote owner and must not run
+        # while the session lifecycle lock is held. Initialization
         # has not started yet, so updating the prompt here still precedes command
         # construction. Immediate orchestrated launches retain the task-aware
         # first-message path (and workflow frozen-memory semantics).
@@ -3785,6 +3871,16 @@ def _notify_elastic_terminal_ended(terminal_id: str) -> None:
         )
 
 
+def _refresh_waiting_labels_of(closed_edges: Iterable[DelegationEdge]) -> None:
+    """Refresh ``cao.waiting`` of every caller whose edge was just closed.
+
+    The import is local because ``delegation_callback_service`` imports this module.
+    """
+    from cli_agent_orchestrator.services import delegation_callback_service
+
+    delegation_callback_service.refresh_waiting_labels(edge.caller_id for edge in closed_edges)
+
+
 def _notify_caller_of_deferred_failure(
     terminal_id: str,
     message: str,
@@ -3821,7 +3917,14 @@ def _notify_caller_of_deferred_failure(
 
     if caller_id:
         try:
-            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+            # A notice CAO wrote: marked, so its own failure is not reported
+            # back to the worker, which did not write it.
+            create_inbox_message(
+                sender_id=terminal_id,
+                receiver_id=caller_id,
+                message=message,
+                is_system_notice=True,
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 "Deferred-init failure notify: could not enqueue inbox message to "
@@ -3841,7 +3944,8 @@ def _notify_caller_of_deferred_failure(
     # The caller has just been told the worker failed. Close its edges here so
     # neither a forward nor a second worker-ended notice follows.
     try:
-        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        closed = close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        _refresh_waiting_labels_of(closed)
     except Exception as exc:  # noqa: BLE001 - best-effort
         logger.warning("Deferred-init failure: could not close edges for %s: %s", terminal_id, exc)
 
@@ -4605,6 +4709,120 @@ async def recover_interrupted_initial_deliveries() -> bool:
                 "Could not settle interrupted initial delivery for %s: %s", terminal_id, exc
             )
     return complete
+
+
+def attach_output_pipeline(
+    terminal_id: str,
+    session_name: str,
+    window_name: str,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    """Attach the FIFO reader, liveness watchdog, and pipe-pane for a terminal.
+
+    Reader creation runs BEFORE ``pipe-pane`` starts so it captures from the
+    start, and enrolls the terminal in the pipe-pane liveness watchdog (#388).
+    When ``replace_existing=True`` (re-attaching a surviving pane after a
+    ``cao-server`` restart), any existing pipe on the pane is stopped first so
+    ``tmux pipe-pane -o`` does not toggle a stale pipe off instead of
+    restarting it.
+    """
+    fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+    def _probe_pane(s: str = session_name, w: str = window_name) -> str:
+        return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+    def _rearm_pipe(s: str = session_name, w: str = window_name, p: str = str(fifo_path)) -> None:
+        get_backend().stop_pipe_pane(s, w)
+        get_backend().pipe_pane(s, w, p)
+
+    created = fifo_manager.create_reader(
+        terminal_id,
+        pane_probe=_probe_pane,
+        rearm=_rearm_pipe,
+        cold_start_check=not replace_existing,
+    )
+    if created is False:
+        return
+    try:
+        if replace_existing:
+            get_backend().stop_pipe_pane(session_name, window_name)
+        get_backend().pipe_pane(session_name, window_name, str(fifo_path))
+    except Exception:
+        try:
+            fifo_manager.stop_reader(terminal_id)
+        except Exception:  # noqa: BLE001 — preserve original attach failure
+            pass
+        raise
+
+
+def reattach_surviving_terminals() -> int:
+    """Re-attach FIFO readers and pipe-pane for terminals that outlived a server restart (#1438).
+
+    Runs at startup after the deferred-init, initial-delivery, and ephemeral
+    sweeps so stranded tombstones and ephemeral residue are not re-attached.
+    Event-inbox backends are skipped. Kept children (#1225), ERROR/deferred-init
+    rows, ephemeral residue, and terminals whose session/pane is no longer live
+    are skipped. A per-terminal failure is logged and leaves that terminal alone.
+
+    For each re-attached terminal, seeds ``WAITING_USER_ANSWER`` from the live
+    viewport when a blocking dialog is already open (it produces no new output
+    until answered), leaving all other statuses ``UNKNOWN`` for the stream.
+    """
+    try:
+        backend = get_backend()
+        if backend.supports_event_inbox():
+            return 0
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Skipping surviving terminal re-attach; backend unavailable: %s", exc)
+        return 0
+
+    try:
+        rows = list_all_terminals()
+    except Exception as exc:  # noqa: BLE001 — startup remains resilient
+        logger.warning("Could not list terminals for surviving re-attach: %s", exc)
+        return 0
+
+    reattached = 0
+    for row in rows:
+        terminal_id = row.get("id")
+        session_name = row.get("tmux_session")
+        window_name = row.get("tmux_window")
+        if not terminal_id or not session_name or not window_name:
+            continue
+        tid = str(terminal_id)
+        sess = str(session_name)
+        win = str(window_name)
+        try:
+            if (
+                row.get("deferred_init_external_owner")
+                or row.get("deferred_init_runtime_reclaimed")
+                or get_deferred_init_failure(tid, row.get("deferred_init_failure")) is not None
+            ):
+                continue
+            if row.get("kept_until") is not None:
+                continue
+            if row.get("ephemeral") and not ephemeral_service.is_live_ephemeral_terminal(tid):
+                continue
+
+            exact = backend.cleanup_terminal_exact(tid, sess, win, close=False)
+            if getattr(exact, "outcome", None) != TerminalCleanupOutcome.STILL_PRESENT:
+                continue
+
+            attach_output_pipeline(tid, sess, win, replace_existing=True)
+            reattached += 1
+            status_monitor.seed_from_viewport(tid, sess, win)
+        except Exception as exc:  # noqa: BLE001 — one terminal must not stop the rest
+            logger.warning(
+                "Failed to re-attach surviving terminal %s (%s:%s): %s",
+                tid,
+                sess,
+                win,
+                exc,
+            )
+    if reattached:
+        logger.info("Re-attached output pipeline for %d surviving terminal(s)", reattached)
+    return reattached
 
 
 def _persist_deferred_init_failure(
@@ -6321,6 +6539,16 @@ def _refuse_if_provider_gone(terminal_id: str, provider: Any, metadata: Dict[str
         )
 
 
+class TerminalRowMissingError(InputNotSentError, ValueError):
+    """``dispatch_input`` found no metadata row, or a step before the send raised ``ValueError``.
+
+    Nothing was typed, and a later attempt cannot get past the same rejection,
+    so the inbox fails such a message at once (reply-delivery-failure F5). It
+    is also a ``ValueError``, so POST /terminals/{id}/input still answers 404,
+    as it did before the send was classified.
+    """
+
+
 def dispatch_input(
     terminal_id: str,
     message: str,
@@ -6360,11 +6588,26 @@ def dispatch_input(
     not logged. It is last and defaulted so existing positional callers (notably
     ``agent_step.run_agent_step``, which passes exactly two arguments) are
     unaffected.
+
+    Raises:
+        TerminalRowMissingError: The terminal has no metadata row. It is both
+            a ``ValueError`` and an ``InputNotSentError``.
+        TerminalInputBlockedError: The terminal refused input (a prompt, a
+            pending identity check, or a provider that exited).
+        TerminalNotFoundError: The backend could not resolve the pane.
+        InputNotSentError: Any other failure before the backend's send call,
+            so nothing was typed (reply-delivery-failure D4); the original
+            exception is its ``__cause__``. A backend may raise it from the
+            send call too, when it proves nothing was written.
+        Exception: Any other failure in or after the send call, when some or
+            all of the text may have reached the terminal.
     """
+    # Set just before the backend's send call: a failure before it typed nothing.
+    sending = False
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
-            raise ValueError(f"Terminal '{terminal_id}' not found")
+            raise TerminalRowMissingError(f"Terminal '{terminal_id}' not found")
 
         # A Kiro terminal is typed into only once its row records that its
         # identity check passed (#1074). Until then the pane may be kiro-cli's
@@ -6505,13 +6748,16 @@ def dispatch_input(
                 provider.mark_input_received()
             provider.record_dispatched_message(message)
 
-        get_backend().send_keys(
+        backend = get_backend()
+        submit_delay = provider.paste_submit_delay if provider else 0.3
+        sending = True
+        backend.send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
             message,
             enter_count=enter_count,
             force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
+            submit_delay=submit_delay,
         )
 
         update_last_active(terminal_id)
@@ -6548,6 +6794,17 @@ def dispatch_input(
 
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
+        # Nothing reached the pane before send_keys (reply-delivery-failure D4).
+        # Refusals and an unresolved pane keep their own types: their callers
+        # branch on them. A missing row is already an InputNotSentError. A
+        # ValueError stays one (POST /terminals/{id}/input maps it to 404).
+        if not sending and not isinstance(
+            e, (TerminalInputBlockedError, TerminalNotFoundError, InputNotSentError)
+        ):
+            if isinstance(e, ValueError):
+                # The text is the 404's detail: keep what the ValueError said.
+                raise TerminalRowMissingError(str(e)) from e
+            raise InputNotSentError(f"{type(e).__name__}: {e}") from e
         raise
 
 
@@ -7284,11 +7541,11 @@ def delete_terminal_row(
     it is needed for the event payload because the row is gone by the time the
     event is built.
 
-    ``registry=None`` drops the row WITHOUT emitting. Session teardown passes
-    None and emits the events itself once it has released the lifecycle lock, so
-    that no third-party plugin ever runs inside its critical section; the
-    single-terminal ``delete_terminal`` path holds no such lock and passes its
-    registry straight through.
+    ``registry=None`` drops the row WITHOUT emitting. Session teardown and the
+    single-terminal ``delete_terminal`` both pass None while they hold the
+    lifecycle lock and emit the event themselves once it is released, so that no
+    third-party plugin ever runs inside the critical section. Callers that hold no
+    lock (keep_service, retention cleanup) pass their registry straight through.
 
     ``end_reason`` (one of ``database.LAUNCH_END_REASONS``) is stamped on the
     terminal's launch record (issue #1082); the caller names why it ended.
@@ -7309,23 +7566,31 @@ def delete_terminal_row(
     # and an edge they left open would stay armed with no terminal behind it,
     # re-evaluated by every sweep. Runs even when another owner deleted the row.
     try:
-        close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        closed = close_open_edges_for_terminal(terminal_id, EdgeState.WORKER_ENDED)
+        _refresh_waiting_labels_of(closed)
     except Exception as exc:  # noqa: BLE001 - best-effort; the row is already gone
         logger.warning("Could not close delegation edges of %s: %s", terminal_id, exc)
     if deleted:
         ephemeral_service.release(terminal_id, "terminal_gone")
     logger.info(f"Deleted terminal: {terminal_id}")
-    if deleted and metadata:
-        dispatch_plugin_event(
-            registry,
-            "post_kill_terminal",
-            PostKillTerminalEvent(
-                session_id=metadata["tmux_session"],
-                terminal_id=terminal_id,
-                agent_name=metadata.get("agent_profile"),
-            ),
-        )
+    if deleted and metadata and registry is not None:
+        _emit_post_kill_terminal(registry, terminal_id, metadata)
     return deleted
+
+
+def _emit_post_kill_terminal(
+    registry: PluginRegistry | None, terminal_id: str, metadata: Dict
+) -> None:
+    """Dispatch ``post_kill_terminal`` for a terminal whose row is already gone."""
+    dispatch_plugin_event(
+        registry,
+        "post_kill_terminal",
+        PostKillTerminalEvent(
+            session_id=metadata["tmux_session"],
+            terminal_id=terminal_id,
+            agent_name=metadata.get("agent_profile"),
+        ),
+    )
 
 
 def delete_terminal(
@@ -7337,9 +7602,76 @@ def delete_terminal(
     have always run. Session teardown does NOT use this -- it interleaves its own
     tmux kill-confirmation between them (see ``services/session_service.py``).
 
+    Runs under ``session_lifecycle_lock`` for the terminal's session (#1468), as
+    ``delete_session`` does. A create commits its row inside that lock and
+    registers its FIFO reader and provider before releasing it, so a delete that
+    takes the lock waits for those registrations and then tears them down,
+    instead of dropping the row while the create is still registering. The row
+    is re-read once the lock is held: a session teardown or another delete may
+    have removed it while this one waited.
+
+    The lock is not reentrant. A caller that already holds it for this session
+    must call ``_delete_terminal_locked`` instead. Synchronous and blocking on a
+    ``threading.Lock``: async callers run it through ``asyncio.to_thread``. The one
+    caller that still runs it on the event loop is the herdr ``pane.closed`` handler
+    (``herdr_inbox_service``), which waits only for another thread's locked section.
+
+    ``post_kill_terminal`` is dispatched AFTER the lock is released, and only when
+    this call deleted the row (as ``delete_session`` does): plugin code is
+    third-party and unbounded, and on the API path this runs in a worker thread
+    with no loop, so ``dispatch_plugin_event`` runs the hook to completion inline.
+    Inside the lock, one slow hook would stall every create and teardown of the
+    session.
+
     Returns False when the teardown was deferred (see
     ``dismantle_terminal_runtime``), leaving the row in place for a retry.
     ``end_reason`` is passed through to ``delete_terminal_row``.
+    """
+    row = get_terminal_metadata(terminal_id)
+    session_name = row.get("tmux_session") if row else None
+    if not session_name:
+        # No row (or no session to lock): nothing a create can be racing with.
+        # The unlocked teardown keeps the old behaviour for this case.
+        deleted, metadata = _teardown_terminal_locked(terminal_id, registry, end_reason=end_reason)
+    else:
+        with session_lifecycle_lock(str(session_name)):
+            if get_terminal_metadata(terminal_id) is None:
+                # Removed while this delete waited for the lock; the remover did
+                # the whole teardown (and emitted the event, if it was a delete).
+                return True
+            deleted, metadata = _teardown_terminal_locked(
+                terminal_id, registry, end_reason=end_reason
+            )
+    if deleted and metadata:
+        # The teardown is finished and durable by here; an event that cannot be
+        # built must not turn a completed delete into a failure.
+        try:
+            _emit_post_kill_terminal(registry, terminal_id, metadata)
+        except Exception as exc:  # noqa: BLE001 - the delete already succeeded
+            logger.warning("Failed to emit post_kill_terminal for %s: %s", terminal_id, exc)
+    return deleted
+
+
+def _delete_terminal_locked(
+    terminal_id: str, registry: PluginRegistry | None = None, *, end_reason: str
+) -> bool:
+    """``delete_terminal``'s teardown, for a caller that already holds the lock.
+
+    The caller must hold ``session_lifecycle_lock`` for the terminal's session
+    (or know there is no row to race with); this function takes no lock. It never
+    emits ``post_kill_terminal``: ``registry`` only reaches the delegation notice.
+    The two herdr callers pass no registry, so they emitted nothing before either.
+    """
+    return _teardown_terminal_locked(terminal_id, registry, end_reason=end_reason)[0]
+
+
+def _teardown_terminal_locked(
+    terminal_id: str, registry: PluginRegistry | None = None, *, end_reason: str
+) -> Tuple[bool, Optional[Dict]]:
+    """The teardown itself: ``(deleted, metadata)``; takes no lock, emits no event.
+
+    ``metadata`` is what ``capture_terminal_snapshot`` returned, for the caller to
+    build ``post_kill_terminal`` from once it has released the lock.
     """
     # Tell any caller waiting on this worker before teardown starts. Imported
     # here because delegation_callback_service imports this module.
@@ -7355,8 +7687,9 @@ def delete_terminal(
             logger.warning(
                 "Terminal %s cleanup deferred; retaining metadata for a retry", terminal_id
             )
-            return False
-        return delete_terminal_row(terminal_id, metadata, registry=registry, end_reason=end_reason)
+            return False, None
+        deleted = delete_terminal_row(terminal_id, metadata, registry=None, end_reason=end_reason)
+        return deleted, metadata
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

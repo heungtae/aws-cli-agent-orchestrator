@@ -144,6 +144,8 @@ export interface HealthInfo {
   components?: Record<string, string>
   /** The server's installed package version. Absent on an older server. */
   version?: string
+  /** The operator's name for this server (`CAO_INSTANCE_LABEL`). Null when unset, absent on an older server. */
+  instance_label?: string | null
 }
 
 // ── Create budgets, sized from the server's provider_init_timeout ───────────
@@ -1378,11 +1380,17 @@ export const api = {
   // equivalent. `source` is a built-in profile name or an https:// URL (the
   // server refuses local paths); `provider` defaults to the profile's
   // frontmatter when omitted (same flag > frontmatter > default order as the CLI).
-  installProfile: (source: string, provider?: string) =>
+  // `content` installs a profile file the browser read itself (the file
+  // picker): `source` is then the file's stem, and the server never sees a path.
+  installProfile: (source: string, provider?: string, content?: string) =>
     fetchJSON<InstallResult>('/agents/profiles/install', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(provider ? { source, provider } : { source }),
+      body: JSON.stringify({
+        source,
+        ...(provider ? { provider } : {}),
+        ...(content !== undefined ? { content } : {}),
+      }),
       timeoutMs: 30000,
     }),
 

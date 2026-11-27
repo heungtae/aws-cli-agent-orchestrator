@@ -115,7 +115,7 @@ No `role` is needed — `allowedTools` is the full specification of what tools t
 | `fs_*` | All filesystem ops | All of the above | All of the above |
 | `web_fetch` | Fetch URLs / search the web | `WebFetch`, `WebSearch` | (not mapped) |
 | `@builtin` | Selector naming the provider's own built-in tool set; **grants nothing by itself** on any provider. Kept in the role defaults for readability; list `fs_*`/`execute_bash` explicitly for the access you want | (no-op) | (no-op) |
-| `@cao-mcp-server` | Every CAO MCP tool: `handoff`, `assign`, `send_message`, Hermes prompt answers via `answer_user_prompt`, memory (`memory_store`/`memory_recall`/`memory_forget`), workflows, `delete_terminal`, and the rest of the `cao-mcp-server` surface | Same | Same |
+| `@cao-mcp-server` | Every CAO MCP tool: `handoff`, `assign`, `send_message`, Hermes prompt answers via `answer_user_prompt`, memory (`memory_store`/`memory_recall`/`memory_related`/`memory_forget`), workflows, `delete_terminal`, and the rest of the `cao-mcp-server` surface | Same | Same |
 | `@cao-ops-mcp-server` | Every operations control-plane tool: `launch_session`, `install_profile`, `shutdown_session`, `send_session_message`, the session/terminal readers, and the `decisions_*` controls. **Not implied by `@cao-mcp-server`** | Same | Same |
 | `discovery` | Sibling discovery/metadata (`list_siblings`, `update_metadata`) | Same | Same |
 | `*` | Everything (unrestricted) | All tools | All tools |
@@ -410,6 +410,16 @@ applied. An unrestricted policy writes `tools: ["*"]`; a profile that sets its
 own `tools` list keeps it. Enforcement is therefore install-time: change the
 profile, re-run `cao install`. Profiles installed before CAO wrote `tools`
 still carry `["*"]`; `cao launch` warns when it finds one.
+
+Because `tools` hides everything it leaves out, a profile that declares
+`cao-mcp-server` and pins `allowedTools` without `@cao-mcp-server` would also
+hide the four callback tools the CAO tool gate always allows (`send_message`,
+`complete_assignment`, `workflow_return`, `answer_user_prompt`). So `cao install`
+adds `@cao-mcp-server/<tool>` for each one the grant does not already cover, to
+both `allowedTools` and `tools`. No other CAO tool is added, and a profile that
+sets its own `tools` list keeps it unchanged. The delegation ceiling treats these
+four references as granting nothing new, since the gate allows them to every
+bound terminal. Profiles installed before this change lack them until reinstalled.
 
 **Kiro CLI, v3 engine (preview, pending the operator checklist)** — `cao install
 … --engine v3` writes one universal file: the v2 fields above, plus

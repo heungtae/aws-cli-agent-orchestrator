@@ -86,9 +86,11 @@ from cli_agent_orchestrator.constants import (
     DECISION_RESPONSE_HEADER,
     DEFAULT_PROVIDER,
     HANDOFF_RESULTS_ROUTE,
+    INBOX_DELIVERY_OUTCOME_WAIT,
     INBOX_IMMEDIATE_DELIVERY_WAIT,
     INBOX_POLLING_INTERVAL,
     INBOX_RECONCILE_INTERVAL,
+    INSTANCE_LABEL_ENV,
     MODEL_ID_MAX_LEN,
     MODEL_ID_RE,
     OTEL_SERVICE_NAME,
@@ -126,7 +128,11 @@ from cli_agent_orchestrator.graph.providers import GraphProvider, get_provider
 from cli_agent_orchestrator.graph.sinks import get_sink
 from cli_agent_orchestrator.models.delegation import EdgeSource
 from cli_agent_orchestrator.models.flow import Flow
-from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
+from cli_agent_orchestrator.models.inbox import (
+    DeliveryOutcome,
+    MessageStatus,
+    OrchestrationType,
+)
 from cli_agent_orchestrator.models.kiro_engine import KiroEngine
 from cli_agent_orchestrator.models.memory import (
     LenientMemoryKey,
@@ -192,10 +198,16 @@ from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.event_log_service import RING_CAPACITY
 from cli_agent_orchestrator.services.event_primitives import KINDS as EVENT_KINDS
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
+from cli_agent_orchestrator.services.flow_service import (
+    FlowDefinitionError,
+    FlowFileMissingError,
+    FlowFileOutsideHomeError,
+    FlowNotFoundError,
+)
 from cli_agent_orchestrator.services.herdr_app_inbox_service import HerdrAppInboxService
 from cli_agent_orchestrator.services.herdr_inbox_registry import set_herdr_inbox_service
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
-from cli_agent_orchestrator.services.inbox_service import inbox_service
+from cli_agent_orchestrator.services.inbox_service import DeliveryHandOff, inbox_service
 from cli_agent_orchestrator.services.install_service import (
     InstallResult,
     KiroAgentPathError,
@@ -228,6 +240,7 @@ from cli_agent_orchestrator.services.worktree_service import WorktreeError
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils import delegation, server_lock
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
+from cli_agent_orchestrator.utils.atomic_file import unlocked_atomic_write
 from cli_agent_orchestrator.utils.delegation import DelegationCeilingError
 from cli_agent_orchestrator.utils.forwarded_env import ForwardedEnvError, validate_forwarded_env
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -1462,11 +1475,25 @@ class InstallAgentProfileRequest(BaseModel):
     ``provider`` may be omitted (None): the install service then honours the
     profile's frontmatter ``provider:`` key, falling back to the default
     provider — the same flag > frontmatter > default precedence as the CLI.
+
+    ``content`` carries a profile document the client read itself (the web
+    UI's file picker), the HTTP equivalent of ``cao install ./agent.md``.
+    The server still never reads a path: ``source`` must then be a bare
+    profile name (the file's stem), and the text goes to ``install_agent``
+    as ``profile_content``, the same import shape the CLI uses.
     """
 
     source: str
     provider: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+    content: Optional[str] = Field(
+        default=None,
+        max_length=262_144,
+        description=(
+            "Profile markdown to import under the bare name in `source`, "
+            "instead of resolving `source` as a name or URL"
+        ),
+    )
 
 
 # Scaffold templates are identified as ``category/name`` (e.g.
@@ -1649,6 +1676,7 @@ class CreateFlowRequest(BaseModel):
     agent_profile: str
     provider: str = "kiro_cli"
     prompt_template: str
+    enabled: bool = True
 
     @field_validator("name")
     @classmethod
@@ -1673,6 +1701,33 @@ class CreateFlowRequest(BaseModel):
         if not v.strip():
             raise ValueError("must not be empty")
         return v
+
+
+class FlowDefinitionInput(BaseModel):
+    """Lax body for ``POST /flows/validate``: every field accepts any JSON value, so a bad
+    value (a number, null, a list) reaches the validator and comes back as a field error
+    instead of a body-parse 422.
+
+    It has no ``script`` field on purpose: validate must never probe a path.
+    """
+
+    name: Any = ""
+    schedule: Any = ""
+    agent_profile: Any = ""
+    provider: Any = "kiro_cli"
+    # Left out means "not given", which validate reports as required, as create does.
+    prompt_template: Any = None
+
+
+class UpdateFlowRequest(BaseModel):
+    """Body of ``PUT /flows/{name}``; every field optional, unknown fields (``script``) refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schedule: Optional[str] = None
+    agent_profile: Optional[str] = None
+    provider: Optional[str] = None
+    prompt_template: Optional[str] = None
 
 
 def _reconcile_memory_at_startup() -> None:
@@ -1897,6 +1952,15 @@ async def lifespan(app: FastAPI):
     inbox_service_task = asyncio.create_task(inbox_service.run(registry))
     delegation_callback_task = asyncio.create_task(delegation_callback_service.run(registry))
     logger.info("Event bus consumers started (StatusMonitor, LogWriter, InboxService)")
+
+    # Re-attach FIFO output pipelines for surviving pipe-pane terminals (#1438).
+    # Runs after the deferred-init, initial-delivery, and ephemeral sweeps so
+    # stranded or residue rows are not re-attached, and after bus.set_loop +
+    # consumer startup so StatusMonitor/LogWriter receive output and seeded status.
+    try:
+        await asyncio.to_thread(terminal_service.reattach_surviving_terminals)
+    except Exception:  # noqa: BLE001 — never block startup on terminal re-attach
+        logger.warning("surviving terminal re-attach failed", exc_info=True)
 
     # Start ApprovalBridge when AG-UI surface is enabled
     approval_bridge_task: Optional[asyncio.Task] = None
@@ -2327,6 +2391,9 @@ async def health_check():
         # can compare the two here when the client runs with a different
         # environment or on another host.
         "provider_init_timeout": int(get_server_settings()["provider_init_timeout"]),
+        # The operator's name for this server (CAO_INSTANCE_LABEL), so the web UI
+        # can say which server it is talking to. Read per request: display only.
+        "instance_label": os.environ.get(INSTANCE_LABEL_ENV, "").strip() or None,
         "components": {
             "cao": "ok",
             "herdr": _probe("herdr"),
@@ -3338,7 +3405,7 @@ async def agui_resume_interrupt(
         decision_enum = ApprovalDecision(body.decision)
     except ValueError:  # pragma: no cover - validate_decision 422s bad values first
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"Invalid decision: {body.decision}",
         )
 
@@ -3350,7 +3417,7 @@ async def agui_resume_interrupt(
         )
     except ValueError as e:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=str(e),
         )
     except DeliveryError as e:
@@ -3954,12 +4021,24 @@ async def install_agent_profile_endpoint(
     https:// URLs; local filesystem paths are handled by the CLI entry point
     alone. A remote caller therefore cannot coerce the server into reading
     arbitrary ``.md`` files from disk.
+
+    A client that has the file itself sends its text as ``content`` with the
+    stem as ``source``. ``install_agent`` then takes its name branch, so a
+    URL or path-shaped ``source`` is refused by the same name validator.
     """
-    result = install_agent(
-        source=request.source,
-        provider=request.provider,
-        env_vars=request.env_vars,
-    )
+    if request.content is not None:
+        result = install_agent(
+            source=request.source,
+            provider=request.provider,
+            env_vars=request.env_vars,
+            profile_content=request.content,
+        )
+    else:
+        result = install_agent(
+            source=request.source,
+            provider=request.provider,
+            env_vars=request.env_vars,
+        )
     if not result.success:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result.message)
 
@@ -4561,7 +4640,7 @@ async def install_agent_plugin(
         # server fault: return the full report so the panel can render every
         # finding rather than a bare error string.
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=_with_untrusted_warning(outcome.to_dict()),
         )
     return _with_untrusted_warning(outcome.to_dict())
@@ -5481,6 +5560,9 @@ async def create_terminal_in_session(
             if existing_edge is None:
                 await asyncio.to_thread(
                     create_delegation_edge, caller_id, result.id, EdgeSource.ASSIGN
+                )
+                await asyncio.to_thread(
+                    delegation_callback_service.refresh_waiting_labels, [caller_id]
                 )
         _set_launch_note(response, launch_plan)
         return result
@@ -7759,14 +7841,14 @@ def _script_root(value: Optional[str]) -> str:
     root = os.path.realpath(value if value is not None else os.getcwd())
     if not os.path.isdir(root):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="working_directory must name an existing directory",
         )
     try:
         return resolve_and_validate_path(root, description="working_directory")
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="working_directory must not be a blocked system directory",
         ) from None
 
@@ -10200,7 +10282,7 @@ async def export_graph_endpoint(
     hit = secret_gate.scan_json_for_secrets(view.to_dict())
     if hit is not None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail=f"export rejected: secret pattern '{hit}' detected",
         )
 
@@ -10356,9 +10438,27 @@ async def create_inbox_message_endpoint(
     sender_id: str,
     message: str,
     expect_reply: bool = False,
+    wait_for_outcome: bool = False,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
-    """Create inbox message and attempt immediate delivery."""
+    """Store an inbox message, attempt its delivery, and report what happened to it.
+
+    The answer's ``delivery`` is the outcome of this message's immediate
+    attempt (reply-delivery-failure D5): ``delivered`` (the paste reached the
+    terminal), ``queued`` (the receiver was not ready, or older messages were
+    ahead), ``failed`` (nothing was typed) or ``uncertain`` (some or all of it
+    may have been typed), or ``in_progress`` when the wait ran out first.
+    ``failed`` and ``uncertain`` set ``success`` false and ``error``; such a
+    message is marked failed and never retried by the server, because the
+    sender now owns the retry. After ``in_progress`` a failure of the message
+    is handled as a queued one (retry or notice).
+
+    The POST waits at most INBOX_IMMEDIATE_DELIVERY_WAIT (5 s) by default.
+    ``wait_for_outcome=true`` raises the wait to INBOX_DELIVERY_OUTCOME_WAIT
+    (45 s). A client that sets it must use an HTTP timeout longer than that
+    wait, or it sees an error for a message that is stored and may still
+    arrive. Clients that do not set it keep the short wait.
+    """
     try:
         inbox_msg = create_inbox_message(
             sender_id,
@@ -10387,31 +10487,39 @@ async def create_inbox_message_endpoint(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Delegation edge update failed for {sender_id} -> {receiver_id}: {e}")
 
-    # Attempt immediate delivery if terminal is already IDLE.
-    # If not, InboxService will deliver on next IDLE status event.
+    # Attempt immediate delivery if the receiver is ready; if not, InboxService
+    # delivers on its next IDLE status event or sweep. The edge rules ran
+    # above, so a reply's in-flight mark exists before the delivery settles it.
     #
-    # deliver_pending reads status_monitor.get_status() (which can fork a tmux
-    # capture-pane via the stale-PROCESSING fallback), paste-bombs the pane on
-    # delivery, and then waits for the receiver to confirm the submit (#78) --
-    # blocking I/O throughout, so it runs on a worker thread. The response does
-    # NOT wait for that confirmation: the message is stored, so a reply of
-    # success is already true, and a sender held past its own HTTP timeout
-    # (30s default) would be tempted to send the message again (PR #1004
-    # review, P2-2). We wait only until the paste has reached the pane, and
-    # only up to INBOX_IMMEDIATE_DELIVERY_WAIT; the attempt itself keeps running
-    # in the background either way.
+    # deliver_pending does blocking I/O (status reads, the paste, the submit
+    # confirmation), so it runs on a worker thread. The answer waits for this
+    # message's outcome, which is reported when the paste lands, not for the
+    # confirmation, and only up to the wait chosen below. A sender held past
+    # its own HTTP timeout (30s default, less for the web UI and the examples)
+    # would be tempted to send the message again (PR #1004 review, P2-2), so
+    # the long wait is for a client that asks for it. The attempt itself keeps
+    # running in the background either way. The hand-off decides who reports a
+    # failure: this POST while it waits, the queued path once it has answered
+    # in_progress.
+    wait_seconds = (
+        INBOX_DELIVERY_OUTCOME_WAIT if wait_for_outcome else INBOX_IMMEDIATE_DELIVERY_WAIT
+    )
     loop = asyncio.get_running_loop()
-    dispatched = asyncio.Event()
+    settled = asyncio.Event()
+    hand_off = DeliveryHandOff()
 
-    def _mark_dispatched() -> None:
-        loop.call_soon_threadsafe(dispatched.set)
+    def _on_outcome(message_id: int, outcome: DeliveryOutcome, error: Optional[str]) -> None:
+        if message_id == inbox_msg.id and hand_off.offer(outcome, error):
+            loop.call_soon_threadsafe(settled.set)
 
     delivery = asyncio.create_task(
         asyncio.to_thread(
             inbox_service.deliver_pending,
             receiver_id,
             registry=get_plugin_registry(request),
-            after_dispatch=_mark_dispatched,
+            on_outcome=_on_outcome,
+            report_to_sender=inbox_msg.id,
+            hand_off=hand_off,
         )
     )
 
@@ -10422,23 +10530,63 @@ async def create_inbox_message_endpoint(
             )
 
     delivery.add_done_callback(_log_outcome)
+    settled_wait = asyncio.create_task(settled.wait())
     try:
-        await asyncio.wait_for(dispatched.wait(), timeout=INBOX_IMMEDIATE_DELIVERY_WAIT)
-    except asyncio.TimeoutError:
-        logger.debug(
-            "Immediate delivery attempt for %s still waiting after %ss; answering "
-            "while it continues in the background",
-            receiver_id,
-            INBOX_IMMEDIATE_DELIVERY_WAIT,
+        await asyncio.wait(
+            {delivery, settled_wait},
+            timeout=wait_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
         )
+    finally:
+        settled_wait.cancel()
+    # The outcome offered so far decides, also when the bound passed at the
+    # same moment; with none, a later failure of this message is handled as
+    # queued, and the answer below says so.
+    outcome = hand_off.abandon()
+    error: Optional[str] = None
+    if outcome is not None:
+        delivery_value = _INBOX_DELIVERY_VALUES[outcome[0]]
+        if outcome[0] == DeliveryOutcome.FAILED:
+            error = outcome[1] or outcome[0].value
+        elif outcome[0] == DeliveryOutcome.UNCERTAIN:
+            # Some or all of the text may be in the terminal: lead with that, so
+            # the sender checks before it sends the message again.
+            error = (
+                f"May have been delivered: {outcome[1] or outcome[0].value}. "
+                "Check the receiver's terminal before you send it again."
+            )
+    elif delivery.done():
+        # The attempt left this message alone, or raised (logged above).
+        delivery_value = "queued"
+    else:
+        logger.debug(
+            "Immediate delivery attempt for %s has no outcome after %ss; answering "
+            "in_progress while it continues in the background",
+            receiver_id,
+            wait_seconds,
+        )
+        delivery_value = "in_progress"
 
     return {
-        "success": True,
+        "success": error is None,
         "message_id": inbox_msg.id,
         "sender_id": inbox_msg.sender_id,
         "receiver_id": inbox_msg.receiver_id,
         "created_at": inbox_msg.created_at.isoformat(),
+        "delivery": delivery_value,
+        "error": error,
     }
+
+
+# What the inbox POST answers for an outcome of its own message. RETRYING
+# cannot reach a POST that still waits (its failures are never retried); it
+# reads as queued should a caller of deliver_pending report one anyway.
+_INBOX_DELIVERY_VALUES = {
+    DeliveryOutcome.DELIVERED: "delivered",
+    DeliveryOutcome.FAILED: "failed",
+    DeliveryOutcome.UNCERTAIN: "uncertain",
+    DeliveryOutcome.RETRYING: "queued",
+}
 
 
 @app.get("/terminals/{terminal_id}/inbox/messages")
@@ -11131,6 +11279,21 @@ async def get_flow(
         )
 
 
+@app.post("/flows/validate")
+async def validate_flow(
+    body: FlowDefinitionInput,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Check a flow definition without writing anything (read scope, like workflow validate)."""
+    errors = flow_service.validate_flow_definition(
+        body.model_dump(), must_be_new=True, require_prompt_template=True
+    )
+    next_runs: List[str] = []
+    if not any(e["field"] == "schedule" for e in errors):
+        next_runs = [t.isoformat() for t in flow_service.next_fire_times(body.schedule, 3)]
+    return {"valid": not errors, "errors": errors, "next_runs": next_runs}
+
+
 @app.post("/flows", response_model=Flow, status_code=status.HTTP_201_CREATED)
 async def create_flow(
     body: CreateFlowRequest,
@@ -11138,14 +11301,24 @@ async def create_flow(
 ) -> Flow:
     """Create a new flow.
 
-    Writes a .flow.md file with YAML frontmatter and prompt body, then
-    registers it via flow_service.add_flow().
+    Answers 422 with ``detail.errors`` for a bad definition, then 409 when the name is
+    taken or the target file is the file another flow is registered from; either way
+    nothing is written. Otherwise it writes a .flow.md file with YAML frontmatter and
+    prompt body and registers it via flow_service.add_flow(). ``enabled=false`` registers
+    it disabled.
     """
+    errors = flow_service.validate_flow_definition(body.model_dump(), must_be_new=False)
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"errors": errors}
+        )
+    flows_dir = CAO_HOME_DIR / "flows"
+    file_path = flows_dir / f"{body.name}.flow.md"
+    conflict = flow_service.find_create_conflict(body.name, str(file_path))
+    if conflict:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=conflict)
     try:
-        flows_dir = CAO_HOME_DIR / "flows"
         flows_dir.mkdir(parents=True, exist_ok=True)
-
-        file_path = flows_dir / f"{body.name}.flow.md"
 
         # Serialize via yaml.safe_dump so a multi-line value becomes a quoted
         # scalar rather than injecting a new frontmatter key.
@@ -11160,15 +11333,46 @@ async def create_flow(
         )
         file_content = "---\n" + frontmatter + "---\n" + body.prompt_template
 
-        file_path.write_text(file_content)
+        # A temp file and a rename, so a symlink at the target is replaced, not written through.
+        unlocked_atomic_write(file_path, file_content)
 
-        return flow_service.add_flow(str(file_path))
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except Exception as e:
+        return flow_service.add_flow(str(file_path), enabled=body.enabled)
+    except ValueError:
+        logger.warning("Flow %r was refused at registration", body.name, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="The flow could not be registered; see the server log",
+        )
+    except Exception:
+        logger.exception("Failed to create flow %r", body.name)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create flow: {str(e)}",
+            detail="Failed to create flow; see the server log",
+        )
+
+
+@app.put("/flows/{name}", response_model=Flow)
+async def update_flow(
+    name: str,
+    body: UpdateFlowRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Flow:
+    """Update a flow in place (schedule, profile, provider, prompt); other front-matter keys stay."""
+    try:
+        return flow_service.update_flow(name, body.model_dump(), CAO_HOME_DIR / "flows")
+    except FlowNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except FlowDefinitionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"errors": e.errors}
+        )
+    except (FlowFileOutsideHomeError, FlowFileMissingError) as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception:
+        logger.exception("Failed to update flow %r", name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update flow; see the server log",
         )
 
 
@@ -11316,6 +11520,16 @@ class InternalMemoryRecallRequest(BaseModel):
     record_access: bool = True
 
 
+class InternalMemoryRelatedRequest(BaseModel):
+    key: str
+    scope: Optional[str] = None
+    depth: int = Field(default=1, ge=1)
+    types: Optional[List[str]] = None
+    direction: str = "both"
+    limit: int = Field(default=20, ge=1, le=100)
+    terminal_context: Optional[InternalMemoryContext] = None
+
+
 class InternalMemoryForgetRequest(BaseModel):
     key: LenientMemoryKey  # see InternalMemoryStoreRequest.key
     scope: MemoryScope = MemoryScope.PROJECT
@@ -11380,6 +11594,58 @@ async def internal_memory_recall(
     # One serializer for both recall surfaces (this route and the MCP
     # memory_recall tool); see models/memory.py.
     return {"memories": [recall_wire_dict(memory) for memory in memories]}
+
+
+@app.post("/internal/memory/related")
+async def internal_memory_related(
+    body: InternalMemoryRelatedRequest,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Any:
+    """Return relationship neighbours using context resolved by a remote worker."""
+    from cli_agent_orchestrator.services.memory_service import InvalidRelatedArgument
+
+    _require_memory_enabled()
+    try:
+        result = cast(
+            Dict[str, Any],
+            await _get_memory_service().related(
+                body.key,
+                scope=body.scope,
+                depth=body.depth,
+                types=body.types,
+                direction=body.direction,
+                limit=body.limit,
+                terminal_context=(
+                    body.terminal_context.model_dump(exclude_none=True)
+                    if body.terminal_context
+                    else None
+                ),
+            ),
+        )
+    except InvalidRelatedArgument as exc:
+        # A fixed literal per cause: the caller's value is never echoed back.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": InvalidRelatedArgument.MESSAGES[exc.code],
+            },
+        )
+    except ValueError:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "success": False,
+                "error_kind": "invalid_argument",
+                "error": "invalid related-memory argument",
+            },
+        )
+    if result.get("error_kind") == "not_found":
+        return JSONResponse(status_code=404, content=result)
+    if result.get("error_kind") == "ambiguous_scope":
+        return JSONResponse(status_code=409, content=result)
+    return result
 
 
 @app.post("/internal/memory/forget")
